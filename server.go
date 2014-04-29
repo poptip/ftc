@@ -79,8 +79,8 @@ func getValidUpgrades() []string {
 // connection is opened successfully.
 type Handler func(*Conn)
 
-// A Server represents a server of an FTC connection.
-type Server struct {
+// A server represents a server of an FTC connection.
+type server struct {
 	// Handler handles an FTC connection.
 	Handler
 
@@ -114,7 +114,7 @@ type Options struct {
 // NewServer allocates and returns a new server with the given
 // options and handler. If nil options are passed, the defaults
 // specified in the constants above are used instead.
-func NewServer(o *Options, h Handler) *Server {
+func NewServer(o *Options, h Handler) *server {
 	if o == nil {
 		o = &Options{}
 	}
@@ -134,7 +134,7 @@ func NewServer(o *Options, h Handler) *Server {
 		o.UpgradeTimeout = DefaultUpgradeTimeout
 	}
 
-	s := &Server{
+	s := &server{
 		Handler:        h,
 		basePath:       o.BasePath,
 		cookieName:     o.CookieName,
@@ -150,7 +150,7 @@ func NewServer(o *Options, h Handler) *Server {
 
 // startReaper continuously removes closed connections from the
 // client set via the reap function.
-func (s *Server) startReaper() {
+func (s *server) startReaper() {
 	for {
 		// TODO(andybons): does this need to be protected by a mutex?
 		if s.clients == nil {
@@ -211,7 +211,7 @@ func handleWSPing(pkt *packet, ws *websocket.Conn) error {
 // wsMainHandler continuously receives on the given WebSocket
 // connection and delegates the packets received to the appropriate
 // handler functions.
-func (s *Server) wsMainHandler(ws *websocket.Conn) {
+func (s *server) wsMainHandler(ws *websocket.Conn) {
 	var c *Conn
 	var sid string
 	for {
@@ -268,7 +268,7 @@ func (s *Server) wsMainHandler(ws *websocket.Conn) {
 // pollingHandler handles all XHR polling requests to the server, initiating
 // a handshake if the request’s session ID does not already exist within
 // the client set.
-func (s *Server) pollingHandler(w http.ResponseWriter, r *http.Request) {
+func (s *server) pollingHandler(w http.ResponseWriter, r *http.Request) {
 	sid := r.FormValue(paramSessionID)
 	if len(sid) > 0 {
 		socket := s.clients.get(sid)
@@ -292,7 +292,7 @@ func (s *Server) pollingHandler(w http.ResponseWriter, r *http.Request) {
 // wsHandshake creates a new FTC Conn with the given WebSocket connection
 // as the underlying transport and calls the server’s Handler. It returns
 // the session ID of the newly-created connection.
-func (s *Server) wsHandshake(ws *websocket.Conn) string {
+func (s *server) wsHandshake(ws *websocket.Conn) string {
 	glog.Infof("starting websocket handleshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportWebSocket)
 	s.clients.add(c)
@@ -305,7 +305,7 @@ func (s *Server) wsHandshake(ws *websocket.Conn) string {
 // pollingHandshake creates a new FTC Conn with the given HTTP Request and
 // ResponseWriter, setting a persistence cookie if necessary and calling
 // the server’s Handler.
-func (s *Server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
+func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
 	glog.Infof("starting polling handleshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportPolling)
 	s.clients.add(c)
@@ -323,7 +323,7 @@ func (s *Server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
 }
 
 // ServeHTTP implements the http.Handler interface for an FTC Server.
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.Header.Get("X-Forwarded-For")
 	if len(remoteAddr) == 0 {
 		remoteAddr = r.RemoteAddr
