@@ -7,6 +7,7 @@ package ftc
 
 import (
 	"encoding/json"
+	"expvar"
 	"fmt"
 	"net/http"
 	"strings"
@@ -62,6 +63,8 @@ var (
 		transportWebSocket: true,
 	}
 )
+
+var numClients = expvar.NewInt("num_clients")
 
 // getValidUpgrades returns a slice containing the valid protocols
 // that a connection can upgrade to.
@@ -156,9 +159,8 @@ func (s *server) startReaper() {
 		if s.clients == nil {
 			glog.Fatal("server cannot have a nil client set")
 		}
-		glog.Infof("reaping clients. count: %d", s.clients.len())
 		s.clients.reap()
-		glog.Infof("clients reaped. count: %d", s.clients.len())
+		numClients.Set(int64(s.clients.len()))
 		time.Sleep(clientReapTimeout)
 	}
 }
@@ -293,12 +295,12 @@ func (s *server) pollingHandler(w http.ResponseWriter, r *http.Request) {
 // as the underlying transport and calls the server’s Handler. It returns
 // the session ID of the newly-created connection.
 func (s *server) wsHandshake(ws *websocket.Conn) string {
-	glog.Infof("starting websocket handleshake. Handler: %+v", s.Handler)
+	glog.Infof("starting websocket handshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportWebSocket)
 	s.clients.add(c)
 	c.wsOpen(ws)
 
-	s.Handler(c)
+	go s.Handler(c)
 	return c.ID
 }
 
@@ -306,7 +308,7 @@ func (s *server) wsHandshake(ws *websocket.Conn) string {
 // ResponseWriter, setting a persistence cookie if necessary and calling
 // the server’s Handler.
 func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
-	glog.Infof("starting polling handleshake. Handler: %+v", s.Handler)
+	glog.Infof("starting polling handshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportPolling)
 	s.clients.add(c)
 

@@ -109,11 +109,14 @@ func (c *Conn) wsOpen(ws *websocket.Conn) {
 	c.ws = ws
 	b, err := newPacket(packetTypeOpen, c).MarshalText()
 	if err != nil {
-		glog.Errorf("problem sending open payload: %v", err)
+		glog.Errorf("problem marshaling open payload: %v", err)
+		c.close()
 		return
 	}
-	if err := websocket.Message.Send(ws, b); err != nil {
+	if err := websocket.Message.Send(ws, string(b)); err != nil {
 		glog.Errorf("problem sending open payload: %v", err)
+		c.close()
+		return
 	}
 	c.upgraded = true
 	c.readyState = readyStateOpen
