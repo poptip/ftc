@@ -3,6 +3,7 @@
 // license that can be found in the LICENSE file.
 // Source code and contact info at http://github.com/poptip/ftc
 
+// Package ftc implements an engine.io-compatible server for persistent client-server connections.
 package ftc
 
 import (
@@ -78,8 +79,22 @@ func getValidUpgrades() []string {
 	return upgrades
 }
 
-// A Handler is called by the server when a
-// connection is opened successfully.
+// A Handler is called by the server when a connection is
+// opened successfully. An example echo handler is shown below.
+//   func EchoServer(c *ftc.Conn) {
+//   	for {
+//   		var msg string
+//   		if err := c.Receive(&msg); err != nil {
+//   			log.Println("receive: %v", err)
+//   			continue
+//   		}
+//   		if err := c.Send(msg); err != nil {
+//   			log.Println("send: %v", err)
+//   		}
+//   	}
+//   }
+// It can then be used in combination with NewServer as follows:
+//   http.Handle("/engine.io/", ftc.NewServer(nil, ftc.Handler(EchoServer)))
 type Handler func(*Conn)
 
 // A server represents a server of an FTC connection.
