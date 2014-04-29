@@ -85,11 +85,11 @@ func getValidUpgrades() []string {
 //   	for {
 //   		var msg string
 //   		if err := c.Receive(&msg); err != nil {
-//   			log.Println("receive: %v", err)
+//   			log.Printf("receive: %v", err)
 //   			continue
 //   		}
 //   		if err := c.Send(msg); err != nil {
-//   			log.Println("send: %v", err)
+//   			log.Printf("send: %v", err)
 //   		}
 //   	}
 //   }
