@@ -16,28 +16,21 @@ import (
 	"github.com/golang/glog"
 )
 
-// Protocol error codes and mappings.
+// The defaults for options passed to the server.
 const (
-	errorTransportUnknown   = 0
-	errorUnknownSID         = 1
-	errorBadHandshakeMethod = 2
-	errorBadRequest         = 3
-)
-
-var errorMessage = map[int]string{
-	errorTransportUnknown:   "Transport unknown",
-	errorUnknownSID:         "Session ID unknown",
-	errorBadHandshakeMethod: "Bad handshake method",
-	errorBadRequest:         "Bad request",
-}
-
-const (
-	// The defaults for options passed to the server.
 	DefaultBasePath       = "/engine.io/"
 	DefaultCookieName     = "io"
 	DefaultPingTimeout    = 60000
 	DefaultPingInterval   = 25000
 	DefaultUpgradeTimeout = 10000
+)
+
+const (
+	// Protocol error codes and mappings.
+	errorTransportUnknown   = 0
+	errorUnknownSID         = 1
+	errorBadHandshakeMethod = 2
+	errorBadRequest         = 3
 
 	// Query parameters used in client requests.
 	paramTransport          = "transport"
@@ -52,6 +45,13 @@ const (
 	// the client pool.
 	clientReapTimeout = 5 * time.Second
 )
+
+var errorMessage = map[int]string{
+	errorTransportUnknown:   "Transport unknown",
+	errorUnknownSID:         "Session ID unknown",
+	errorBadHandshakeMethod: "Bad handshake method",
+	errorBadRequest:         "Bad request",
+}
 
 var (
 	validTransports = map[string]bool{
@@ -247,7 +247,7 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 		}
 		c.ws = ws
 
-		switch pkt.type_ {
+		switch pkt.typ {
 		case packetTypePing:
 			if err := handleWSPing(pkt, ws); err != nil {
 				glog.Errorf("problem handling websocket ping packet: %+v; error: %v", pkt, err)

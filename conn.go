@@ -155,7 +155,7 @@ func (c *Conn) onPacket(p *packet) {
 		return
 	}
 	glog.Infoln("got packet:", *p)
-	switch p.type_ {
+	switch p.typ {
 	case packetTypePing:
 		c.sendPacket(newPacket(packetTypePong, p.data))
 	case packetTypeMessage:

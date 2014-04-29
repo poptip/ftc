@@ -41,8 +41,8 @@ func TestEncodeDecodePayload(t *testing.T) {
 		t.Fatalf("unable to umarshal payload with text %q: %s", text, err)
 	}
 	for i, pkt := range newP {
-		if p[i].type_ != pkt.type_ {
-			t.Errorf("packet at index %d expected type %s, but got %s", i, p[i], pkt.type_)
+		if p[i].typ != pkt.typ {
+			t.Errorf("packet at index %d expected type %s, but got %s", i, p[i], pkt.typ)
 		}
 		if p[i].data != nil {
 			if pkt.data == nil {

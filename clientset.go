@@ -27,16 +27,16 @@ func (c *clientSet) get(id string) *Conn {
 }
 
 // add adds a connection to the set keyed off its ID field.
-func (c *clientSet) add(conn_ *Conn) {
+func (c *clientSet) add(con *Conn) {
 	c.Lock()
-	c.clients[conn_.ID] = conn_
+	c.clients[con.ID] = con
 	c.Unlock()
 }
 
 // remove removes a connection from the set.
-func (c *clientSet) remove(conn_ *Conn) {
+func (c *clientSet) remove(con *Conn) {
 	c.Lock()
-	delete(c.clients, conn_.ID)
+	delete(c.clients, con.ID)
 	c.Unlock()
 }
 
