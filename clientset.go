@@ -7,41 +7,49 @@ package ftc
 
 import "sync"
 
+// A clientSet represents a pool of connections keyed off
+// of their IDs.
 type clientSet struct {
 	sync.RWMutex
 	clients map[string]*Conn
 }
 
+// newClientSet allocates and returns a new clientSet.
 func newClientSet() *clientSet {
-	return &clientSet{
-		clients: map[string]*Conn{},
-	}
+	return &clientSet{clients: map[string]*Conn{}}
 }
 
+// get returns the connection with the given ID, nil otherwise.
 func (c *clientSet) get(id string) *Conn {
 	c.RLock()
 	defer c.RUnlock()
 	return c.clients[id]
 }
 
-func (c *clientSet) set(id string, s *Conn) {
+// add adds a connection to the set keyed off its ID field.
+func (c *clientSet) add(conn_ *Conn) {
 	c.Lock()
-	c.clients[id] = s
+	c.clients[conn_.ID] = conn_
 	c.Unlock()
 }
 
-func (c *clientSet) remove(id string) {
+// remove removes a connection from the set.
+func (c *clientSet) remove(conn_ *Conn) {
 	c.Lock()
-	delete(c.clients, id)
+	delete(c.clients, conn_.ID)
 	c.Unlock()
 }
 
+// len returns the number of connections in the set.
+// The connections may be open or closed.
 func (c *clientSet) len() int {
 	c.RLock()
 	defer c.RUnlock()
 	return len(c.clients)
 }
 
+// reap iterates through the set and removes any closed
+// connections.
 func (c *clientSet) reap() {
 	c.RLock()
 	toDelete := []string{}

@@ -32,19 +32,24 @@ var errorMessage = map[int]string{
 }
 
 const (
-	defaultBasePath       = "/engine.io/"
-	defaultCookieName     = "io"
-	defaultPingTimeout    = 60000
-	defaultPingInterval   = 25000
-	defaultUpgradeTimeout = 10000
+	// The defaults for options passed to the server.
+	DefaultBasePath       = "/engine.io/"
+	DefaultCookieName     = "io"
+	DefaultPingTimeout    = 60000
+	DefaultPingInterval   = 25000
+	DefaultUpgradeTimeout = 10000
 
+	// Query parameters used in client requests.
 	paramTransport          = "transport"
 	paramSessionID          = "sid"
 	paramJSONPResponseIndex = "j"
 
+	// Available transports.
 	transportWebSocket = "websocket"
 	transportPolling   = "polling"
 
+	// The default time before closed connections are cleaned from
+	// the client pool.
 	clientReapTimeout = 5 * time.Second
 )
 
@@ -58,6 +63,8 @@ var (
 	}
 )
 
+// getValidUpgrades returns a slice containing the valid protocols
+// that a connection can upgrade to.
 func getValidUpgrades() []string {
 	upgrades := make([]string, len(validUpgrades))
 	i := 0
@@ -68,50 +75,66 @@ func getValidUpgrades() []string {
 	return upgrades
 }
 
+// A Handler is called by the server when a
+// connection is opened successfully.
 type Handler func(*Conn)
 
-type server struct {
-	basePath       string
-	cookieName     string
+// A Server represents a server of an FTC connection.
+type Server struct {
+	// Handler handles an FTC connection.
+	Handler
+
+	basePath   string
+	cookieName string
+
 	pingTimeout    int
 	pingInterval   int
 	upgradeTimeout int
-	clients        *clientSet
-	wsServer       *websocket.Server
 
-	Handler
+	clients  *clientSet        // The set of connections (some may be closed).
+	wsServer *websocket.Server // The underlying WebSocket server.
 }
 
+// Options are the parameters passed to the server.
 type Options struct {
-	BasePath       string
-	CookieName     string
-	DisableCookie  bool
-	PingTimeout    int
-	PingInterval   int
+	// BasePath is the base URL path that the server handles requests for.
+	BasePath string
+	// CookieName is the name of the cookie set upon successful handshake.
+	CookieName string
+	// DisableCookie is true if no cookies should be set upon handshake.
+	DisableCookie bool
+	// PingTimeout is how long a ping packet can hang before the Conn is considered closed.
+	PingTimeout int
+	// PingInterval specifies how often a ping packet should be sent to the server.
+	PingInterval int
+	// UpgradeTimeout specifies the maximum time an upgrade can take.
 	UpgradeTimeout int
 }
 
-func NewServer(o *Options, h Handler) *server {
+// NewServer allocates and returns a new server with the given
+// options and handler. If nil options are passed, the defaults
+// specified in the constants above are used instead.
+func NewServer(o *Options, h Handler) *Server {
 	if o == nil {
 		o = &Options{}
 	}
 	if len(o.BasePath) == 0 {
-		o.BasePath = defaultBasePath
+		o.BasePath = DefaultBasePath
 	}
 	if len(o.CookieName) == 0 && !o.DisableCookie {
-		o.CookieName = defaultCookieName
+		o.CookieName = DefaultCookieName
 	}
 	if o.PingInterval == 0 {
-		o.PingInterval = defaultPingInterval
+		o.PingInterval = DefaultPingInterval
 	}
 	if o.PingTimeout == 0 {
-		o.PingTimeout = defaultPingTimeout
+		o.PingTimeout = DefaultPingTimeout
 	}
 	if o.UpgradeTimeout == 0 {
-		o.UpgradeTimeout = defaultUpgradeTimeout
+		o.UpgradeTimeout = DefaultUpgradeTimeout
 	}
 
-	s := &server{
+	s := &Server{
 		Handler:        h,
 		basePath:       o.BasePath,
 		cookieName:     o.CookieName,
@@ -125,10 +148,13 @@ func NewServer(o *Options, h Handler) *server {
 	return s
 }
 
-func (s *server) startReaper() {
+// startReaper continuously removes closed connections from the
+// client set via the reap function.
+func (s *Server) startReaper() {
 	for {
+		// TODO(andybons): does this need to be protected by a mutex?
 		if s.clients == nil {
-			break
+			glog.Fatal("server cannot have a nil client set")
 		}
 		glog.Infof("reaping clients. count: %d", s.clients.len())
 		s.clients.reap()
@@ -137,6 +163,8 @@ func (s *server) startReaper() {
 	}
 }
 
+// receiveWSPacket calls receive on the given WebSocket connection
+// and unmarshals it into the given packet.
 func receiveWSPacket(ws *websocket.Conn, pkt *packet) error {
 	var msg string
 	if err := websocket.Message.Receive(ws, &msg); err != nil {
@@ -149,6 +177,8 @@ func receiveWSPacket(ws *websocket.Conn, pkt *packet) error {
 	return nil
 }
 
+// sendWSPacket marshals the given packet and sends it over the
+// given WebSocket connection.
 func sendWSPacket(ws *websocket.Conn, pkt *packet) error {
 	if ws == nil || pkt == nil {
 		return fmt.Errorf("nil websocket or packet ws: %+v, pkt: %+v", ws, pkt)
@@ -164,8 +194,10 @@ func sendWSPacket(ws *websocket.Conn, pkt *packet) error {
 	return nil
 }
 
+// handleWSPing send the appropriate response packet (pong) with the
+// same data as the given packet over the given WebSocket connection.
 func handleWSPing(pkt *packet, ws *websocket.Conn) error {
-	resp := newPacket(packetTypePong, pkt.Data())
+	resp := newPacket(packetTypePong, pkt.data)
 	b, err := resp.MarshalText()
 	if err != nil {
 		return err
@@ -176,7 +208,10 @@ func handleWSPing(pkt *packet, ws *websocket.Conn) error {
 	return nil
 }
 
-func (s *server) wsMainHandler(ws *websocket.Conn) {
+// wsMainHandler continuously receives on the given WebSocket
+// connection and delegates the packets received to the appropriate
+// handler functions.
+func (s *Server) wsMainHandler(ws *websocket.Conn) {
 	var c *Conn
 	var sid string
 	for {
@@ -212,14 +247,14 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 		}
 		c.ws = ws
 
-		switch pkt.Type() {
+		switch pkt.type_ {
 		case packetTypePing:
 			if err := handleWSPing(pkt, ws); err != nil {
 				glog.Errorf("problem handling websocket ping packet: %+v; error: %v", pkt, err)
 				break
 			}
 			// Force a polling cycle to ensure a fast upgrade.
-			if data, _ := pkt.Data().(string); data == messageProbe {
+			if data, _ := pkt.data.(string); data == messageProbe {
 				c.sendPacket(newPacket(packetTypeNoop, nil))
 			}
 		case packetTypeUpgrade:
@@ -230,7 +265,10 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 	c.close()
 }
 
-func (s *server) pollingHandler(w http.ResponseWriter, r *http.Request) {
+// pollingHandler handles all XHR polling requests to the server, initiating
+// a handshake if the request’s session ID does not already exist within
+// the client set.
+func (s *Server) pollingHandler(w http.ResponseWriter, r *http.Request) {
 	sid := r.FormValue(paramSessionID)
 	if len(sid) > 0 {
 		socket := s.clients.get(sid)
@@ -251,20 +289,26 @@ func (s *server) pollingHandler(w http.ResponseWriter, r *http.Request) {
 	s.pollingHandshake(w, r)
 }
 
-func (s *server) wsHandshake(ws *websocket.Conn) string {
+// wsHandshake creates a new FTC Conn with the given WebSocket connection
+// as the underlying transport and calls the server’s Handler. It returns
+// the session ID of the newly-created connection.
+func (s *Server) wsHandshake(ws *websocket.Conn) string {
 	glog.Infof("starting websocket handleshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportWebSocket)
-	s.clients.set(c.ID, c)
+	s.clients.add(c)
 	c.wsOpen(ws)
 
 	s.Handler(c)
 	return c.ID
 }
 
-func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
+// pollingHandshake creates a new FTC Conn with the given HTTP Request and
+// ResponseWriter, setting a persistence cookie if necessary and calling
+// the server’s Handler.
+func (s *Server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
 	glog.Infof("starting polling handleshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportPolling)
-	s.clients.set(c.ID, c)
+	s.clients.add(c)
 
 	if len(s.cookieName) > 0 {
 		glog.Infoln("setting cookie:", s.cookieName, c.ID)
@@ -278,7 +322,8 @@ func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
 	go s.Handler(c)
 }
 
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// ServeHTTP implements the http.Handler interface for an FTC Server.
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	remoteAddr := r.Header.Get("X-Forwarded-For")
 	if len(remoteAddr) == 0 {
 		remoteAddr = r.RemoteAddr
@@ -299,6 +344,8 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.pollingHandler(w, r)
 }
 
+// serverError sends a JSON-encoded message to the given ResponseWriter
+// with the given error code.
 func serverError(w http.ResponseWriter, code int) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusBadRequest)

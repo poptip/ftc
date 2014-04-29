@@ -27,7 +27,7 @@ func startServer() {
 
 func TestBadSID(t *testing.T) {
 	once.Do(startServer)
-	addr := "http://" + serverAddr + defaultBasePath + "?transport=polling&sid=test"
+	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling&sid=test"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Error(err)

@@ -27,34 +27,24 @@ const (
 // A packet is a single unit of data to be sent or received.
 // Usually, they are encompassed in payload objects.
 type packet struct {
-	typ  string      `json:"type"`
-	data interface{} `json:"data"`
-}
-
-// Type returns the packet type.
-func (p *packet) Type() string {
-	return p.typ
-}
-
-// Data returns the packet data.
-func (p *packet) Data() interface{} {
-	return p.data
+	type_ string      `json:"type"`
+	data  interface{} `json:"data"`
 }
 
 // MarshalText encodes the packet into UTF-8-encoded text and returns the result.
 func (p *packet) MarshalText() ([]byte, error) {
 	if p.data == nil {
-		return []byte(p.typ), nil
+		return []byte(p.type_), nil
 	}
 	switch t := p.data.(type) {
 	case string:
-		return []byte(p.typ + t), nil
+		return []byte(p.type_ + t), nil
 	default:
 		b, err := json.Marshal(t)
 		if err != nil {
 			return nil, fmt.Errorf("could not marshal value %v of type %T: %v", t, t, err)
 		}
-		return []byte(p.typ + string(b)), nil
+		return []byte(p.type_ + string(b)), nil
 	}
 }
 
@@ -62,7 +52,7 @@ func (p *packet) MarshalText() ([]byte, error) {
 // UnmarshalText must copy the text if it wishes to retain the text after returning.
 func (p *packet) UnmarshalText(text []byte) error {
 	s := string(text)
-	for _, typ := range []string{
+	for _, type_ := range []string{
 		packetTypeOpen,
 		packetTypeClose,
 		packetTypePing,
@@ -71,16 +61,17 @@ func (p *packet) UnmarshalText(text []byte) error {
 		packetTypeUpgrade,
 		packetTypeNoop,
 	} {
-		if strings.HasPrefix(s, typ) {
-			*p = packet{typ: typ, data: strings.TrimPrefix(s, typ)}
+		if strings.HasPrefix(s, type_) {
+			*p = packet{type_: type_, data: strings.TrimPrefix(s, type_)}
 			return nil
 		}
 	}
 	return fmt.Errorf("invalid packet type for %q", s)
 }
 
+// newPacket allocates and returns a new packet.
 func newPacket(typ string, data interface{}) *packet {
-	return &packet{typ: typ, data: data}
+	return &packet{type_: typ, data: data}
 }
 
 // A payload is a series of encoded packets.

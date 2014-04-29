@@ -12,9 +12,9 @@ func TestClientSetBasic(t *testing.T) {
 	c1 := &Conn{ID: "foo"}
 	c2 := &Conn{ID: "bar"}
 	c3 := &Conn{ID: "baz"}
-	s.set(c1.ID, c1)
-	s.set(c2.ID, c2)
-	s.set(c3.ID, c3)
+	s.add(c1)
+	s.add(c2)
+	s.add(c3)
 	if s.len() != 3 {
 		t.Errorf("expected set length to be 3, was %d", s.len())
 	}
@@ -27,7 +27,7 @@ func TestClientSetBasic(t *testing.T) {
 	if c != nil || s.len() != 2 {
 		t.Errorf("expected Conn to be reaped due to being in closed state, got %+v", c)
 	}
-	s.remove(c1.ID)
+	s.remove(c1)
 	c = s.get(c1.ID)
 	if c != nil || s.len() != 1 {
 		t.Errorf("expected Conn with ID %s to be removed, got %+v", c1.ID, c)
