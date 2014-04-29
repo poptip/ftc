@@ -1,4 +1,3 @@
-ftc
-===
-
-FTC (Fault Tolerant Connection) is a Go library that provides fault-tolerant, persistent client-server connections.
+FTC
+=========
+FTC (fault tolerant connection) is an engine.io-compatible library that provides fault-tolerant, persistent client-server connections.
