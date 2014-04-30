@@ -110,12 +110,12 @@ func (c *Conn) wsOpen(ws *websocket.Conn) {
 	b, err := newPacket(packetTypeOpen, c).MarshalText()
 	if err != nil {
 		glog.Errorf("problem marshaling open payload: %v", err)
-		c.close()
+		c.Close()
 		return
 	}
 	if err := websocket.Message.Send(ws, string(b)); err != nil {
 		glog.Errorf("problem sending open payload: %v", err)
-		c.close()
+		c.Close()
 		return
 	}
 	c.upgraded = true
@@ -139,12 +139,16 @@ func (c *Conn) pollingOpen(w http.ResponseWriter, r *http.Request) {
 	c.readyState = readyStateOpen
 }
 
-// close closes the connection.
-func (c *Conn) close() {
+// Close closes the connection.
+func (c *Conn) Close() {
 	glog.Infof("closing ftc Connection %p", c)
 	c.readyState = readyStateClosing
-	close(c.send)
-	close(c.closer)
+	if c.send != nil {
+		close(c.send)
+	}
+	if c.closer != nil {
+		close(c.closer)
+	}
 	c.ws = nil
 	c.rw = nil
 	c.readyState = readyStateClosed
@@ -166,7 +170,7 @@ func (c *Conn) onPacket(p *packet) {
 	case packetTypeUpgrade:
 		c.onUpgrade(p)
 	case packetTypeClose:
-		c.close()
+		c.Close()
 	}
 }
 
@@ -249,7 +253,7 @@ func (c *Conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
 		glog.Infof("GET timeout for Conn %p", c)
 		buf = payload{newPacket(packetTypeNoop, nil)}
 	}
-	glog.Infof("sending buffer: %+v", buf)
+	glog.Infof("sending payload with %d packet(s)", len(buf))
 	b, err := buf.MarshalText()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)

@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"expvar"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -248,7 +249,9 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 		glog.Infoln("waiting for websocket message")
 		pkt := &packet{}
 		if err := receiveWSPacket(ws, pkt); err != nil {
-			glog.Errorln("websocket read message error:", err)
+			if err != io.EOF {
+				glog.Errorln("websocket read message error:", err)
+			}
 			break
 		}
 		glog.Infof("got websocket packet %+v from conn %p", pkt, ws)
@@ -279,7 +282,7 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 		}
 	}
 	glog.Infof("closing websocket connection %p", ws)
-	c.close()
+	c.Close()
 }
 
 // pollingHandler handles all XHR polling requests to the server, initiating
@@ -315,7 +318,9 @@ func (s *server) wsHandshake(ws *websocket.Conn) string {
 	s.clients.add(c)
 	c.wsOpen(ws)
 
-	go s.Handler(c)
+	if s.Handler != nil {
+		go s.Handler(c)
+	}
 	return c.ID
 }
 
@@ -336,7 +341,9 @@ func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
 	}
 	c.pollingOpen(w, r)
 	glog.Infof("polling handleshake complete. calling Handler: %+v", s.Handler)
-	go s.Handler(c)
+	if s.Handler != nil {
+		go s.Handler(c)
+	}
 }
 
 // ServeHTTP implements the http.Handler interface for an FTC Server.
