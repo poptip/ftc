@@ -54,7 +54,7 @@ func (c *clientSet) reap() {
 	c.RLock()
 	toDelete := []string{}
 	for k, s := range c.clients {
-		if s.readyState == readyStateClosed {
+		if s.readyState() == readyStateClosed {
 			toDelete = append(toDelete, k)
 		}
 	}

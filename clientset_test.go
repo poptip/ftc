@@ -21,7 +21,7 @@ func TestClientSetBasic(t *testing.T) {
 	if s.get(c1.ID) != c1 {
 		t.Errorf("expected Conn with ID %s, got %+v", c1.ID, s.get(c1.ID))
 	}
-	c3.readyState = readyStateClosed
+	c3.setReadyState(readyStateClosed)
 	s.reap()
 	c := s.get(c3.ID)
 	if c != nil || s.len() != 2 {

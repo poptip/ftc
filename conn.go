@@ -12,6 +12,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"reflect"
+	"sync"
 	"time"
 
 	"code.google.com/p/go.net/websocket"
@@ -44,20 +45,22 @@ func newID() string {
 
 // A Conn represents an FTC connection.
 type Conn struct {
-	rw http.ResponseWriter `json:"-"`
-	ws *websocket.Conn     `json:"-"`
+	wsMu sync.RWMutex    `json:"-"`
+	ws   *websocket.Conn `json:"-"`
 
 	ID           string   `json:"sid"`
 	Upgrades     []string `json:"upgrades"`
 	PingInterval int      `json:"pingInterval"`
 	PingTimeout  int      `json:"pingTimeout"`
 
-	readyState string           `json:"-"`
-	transport  string           `json:"-"`
-	upgraded   bool             `json:"-"`
-	send       chan payload     `json:"-"`
-	messages   chan interface{} `json:"-"`
-	closer     chan struct{}    `json:"-"`
+	stateMu sync.RWMutex `json:"-"`
+	state   string       `json:"-"`
+
+	transport string           `json:"-"`
+	upgraded  bool             `json:"-"`
+	send      chan payload     `json:"-"`
+	messages  chan interface{} `json:"-"`
+	closer    chan struct{}    `json:"-"`
 }
 
 // Receive receives a single message from the connection into v.
@@ -65,7 +68,7 @@ func (c *Conn) Receive(v interface{}) error {
 	if c == nil {
 		return errors.New("attempt to receive on a nil connection")
 	}
-	if c.readyState == readyStateClosing || c.readyState == readyStateClosed {
+	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
 		return errors.New("attempt to receive on a closed connection")
 	}
 	msg := <-c.messages
@@ -79,7 +82,7 @@ func (c *Conn) Send(v interface{}) error {
 	if c == nil {
 		return errors.New("attempt to receive on a nil connection")
 	}
-	if c.readyState == readyStateClosing || c.readyState == readyStateClosed {
+	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
 		return errors.New("attempt to receive on a closed connection")
 	}
 	c.send <- payload{newPacket(packetTypeMessage, v)}
@@ -93,7 +96,7 @@ func newConn(pingInterval, pingTimeout int, transport string) *Conn {
 		Upgrades:     getValidUpgrades(),
 		PingInterval: pingInterval,
 		PingTimeout:  pingTimeout,
-		readyState:   readyStateOpening,
+		state:        readyStateOpening,
 		send:         make(chan payload),
 		messages:     make(chan interface{}, 256),
 		closer:       make(chan struct{}, 1),
@@ -101,12 +104,29 @@ func newConn(pingInterval, pingTimeout int, transport string) *Conn {
 	}
 }
 
+// readyState returns the current state of the connection. It is safe
+// to be called from multiple goroutines.
+func (c *Conn) readyState() string {
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.state
+}
+
+// setReadyState sets the current state of the connection. It is safe
+// to be called from multiple goroutines.
+func (c *Conn) setReadyState(s string) {
+	c.stateMu.Lock()
+	c.state = s
+	c.stateMu.Unlock()
+}
+
 // wsOpen sends an "open" packet to the underlying WebSocket
 // connection and is used during the initial handshake process.
 func (c *Conn) wsOpen(ws *websocket.Conn) {
-	// TODO(andybons): do we need to keep references to this around?
 	// TODO(andybons): ensure that this is only called once on a connection.
+	c.wsMu.Lock()
 	c.ws = ws
+	c.wsMu.Unlock()
 	b, err := newPacket(packetTypeOpen, c).MarshalText()
 	if err != nil {
 		glog.Errorf("problem marshaling open payload: %v", err)
@@ -119,7 +139,7 @@ func (c *Conn) wsOpen(ws *websocket.Conn) {
 		return
 	}
 	c.upgraded = true
-	c.readyState = readyStateOpen
+	c.setReadyState(readyStateOpen)
 	c.transport = transportWebSocket
 	go c.webSocketListener()
 }
@@ -127,7 +147,6 @@ func (c *Conn) wsOpen(ws *websocket.Conn) {
 // pollingOpen sends an "open" packet to the underlying XHR polling
 // connection and is used during the initial handshake.
 func (c *Conn) pollingOpen(w http.ResponseWriter, r *http.Request) {
-	c.rw = w
 	setPollingHeaders(w, r)
 	payload := payload{newPacket(packetTypeOpen, c)}
 	b, err := payload.MarshalText()
@@ -136,28 +155,35 @@ func (c *Conn) pollingOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fmt.Fprintf(w, "%s", b)
-	c.readyState = readyStateOpen
+	c.setReadyState(readyStateOpen)
 }
 
 // Close closes the connection.
 func (c *Conn) Close() {
+	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
+		return
+	}
 	glog.Infof("closing ftc Connection %p", c)
-	c.readyState = readyStateClosing
+	c.setReadyState(readyStateClosing)
 	if c.send != nil {
 		close(c.send)
 	}
 	if c.closer != nil {
 		close(c.closer)
 	}
-	c.ws = nil
-	c.rw = nil
-	c.readyState = readyStateClosed
+	c.wsMu.Lock()
+	if c.ws != nil {
+		c.Close()
+		c.ws = nil
+	}
+	c.wsMu.Unlock()
+	c.setReadyState(readyStateClosed)
 }
 
 // onPacket is called for each packet received by the connection
 // and responds to or dispatches the packets accordingly.
 func (c *Conn) onPacket(p *packet) {
-	if c.readyState != readyStateOpen {
+	if c.readyState() != readyStateOpen {
 		glog.Errorln("called on non-open connection")
 		return
 	}
@@ -179,8 +205,8 @@ func (c *Conn) onPacket(p *packet) {
 // TODO(andybons): consolidate with wsOpen?
 func (c *Conn) onUpgrade(pkt *packet) {
 	glog.Infof("got upgrade packet: %+v", pkt)
-	if c.readyState != readyStateOpen {
-		glog.Errorf("upgrade called with non-open ready state %s; packet: %+v", c.readyState, pkt)
+	if c.readyState() != readyStateOpen {
+		glog.Errorf("upgrade called with non-open ready state %s; packet: %+v", c.readyState(), pkt)
 		return
 	}
 	if c.upgraded && c.transport == transportWebSocket {
@@ -203,7 +229,7 @@ func (c *Conn) onMessage(data interface{}) {
 
 // sendPacket sends the given packet p to the connection.
 func (c *Conn) sendPacket(p *packet) {
-	if c.readyState != readyStateOpen {
+	if c.readyState() != readyStateOpen {
 		glog.Errorln("called on non-open Connection")
 		return
 	}
@@ -268,12 +294,21 @@ func (c *Conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
 // by sending an empty struct to the closer channel.
 func (c *Conn) webSocketListener() {
 	glog.Infof("starting websocket listener for socket %s", c.ID)
-	defer c.ws.Close()
+	defer func(c *Conn) {
+		c.wsMu.RLock()
+		if c.ws != nil {
+			c.ws.Close()
+		}
+		c.wsMu.RUnlock()
+	}(c)
 	for {
 		select {
 		case p := <-c.send:
 			for _, pkt := range p {
-				if err := sendWSPacket(c.ws, pkt); err != nil {
+				c.wsMu.RLock()
+				err := sendWSPacket(c.ws, pkt)
+				c.wsMu.RUnlock()
+				if err != nil {
 					glog.Errorln("websocket send error:", err)
 					continue
 				}
