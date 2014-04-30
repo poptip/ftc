@@ -107,7 +107,24 @@ func TestSetCookie(t *testing.T) {
 	}
 }
 
-func handshakePolling(t *testing.T) *Conn {
+func validateConn(c Conn, t *testing.T) {
+	if len(c.ID) == 0 {
+		t.Error("session id of conn is empty.")
+	}
+	for _, u := range c.Upgrades {
+		if !validUpgrades[u] {
+			t.Errorf("%s is not a valid upgrade.", u)
+		}
+	}
+	if c.PingInterval != ftcServer.pingInterval {
+		t.Errorf("ping intervals don’t match. client: %d; server: %d", c.PingInterval, ftcServer.pingInterval)
+	}
+	if c.PingTimeout != ftcServer.pingTimeout {
+		t.Errorf("ping timeouts don’t match. client: %d; server: %d", c.PingTimeout, ftcServer.pingTimeout)
+	}
+}
+
+func handshakePolling(t *testing.T) string {
 	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling"
 	resp, err := http.Get(addr)
 	if err != nil {
@@ -129,33 +146,19 @@ func handshakePolling(t *testing.T) *Conn {
 	if err := json.Unmarshal([]byte(p[0].data.(string)), &c); err != nil {
 		t.Fatalf("json unmarshal error: %v", err)
 	}
-	if len(c.ID) == 0 {
-		t.Error("session id of conn is empty.")
-	}
-	for _, u := range c.Upgrades {
-		if !validUpgrades[u] {
-			t.Errorf("%s is not a valid upgrade.", u)
-		}
-	}
-	if c.PingInterval != ftcServer.pingInterval {
-		t.Errorf("ping intervals don’t match. client: %d; server: %d", c.PingInterval, ftcServer.pingInterval)
-	}
-	if c.PingTimeout != ftcServer.pingTimeout {
-		t.Errorf("ping timeouts don’t match. client: %d; server: %d", c.PingTimeout, ftcServer.pingTimeout)
-	}
-	return &c
+	validateConn(c, t)
+	return c.ID
 }
 
 func TestXHRPolling(t *testing.T) {
-	c := handshakePolling(t)
-	defer c.Close()
+	sid := handshakePolling(t)
 	// Send a message.
 	p := payload{newPacket(packetTypeMessage, "hello")}
 	b, err := p.MarshalText()
 	if err != nil {
 		t.Fatalf("could not marshal payload: %v", err)
 	}
-	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling&sid=" + c.ID
+	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling&sid=" + sid
 	resp, err := http.Post(addr, "text/plain;charset=UTF-8", bytes.NewBuffer(b))
 	if err != nil {
 		t.Fatalf("http post error: %v", err)
@@ -187,5 +190,48 @@ func TestXHRPolling(t *testing.T) {
 	}
 	if msg[0].typ != p[0].typ || msg[0].data.(string) != msg[0].data.(string) {
 		t.Errorf("mismatch of packets: %+v and %+v", msg[0], p[0])
+	}
+}
+
+func TestWebSockets(t *testing.T) {
+	ws, err := websocket.Dial("ws://"+serverAddr+DefaultBasePath+"?transport=websocket", "", "http://"+serverAddr)
+	if err != nil {
+		t.Fatalf("websocket dial error: %v", err)
+	}
+	defer ws.Close()
+	var msg []byte
+	if err := websocket.Message.Receive(ws, &msg); err != nil {
+		t.Fatalf("error receiving websocket message: %v", err)
+	}
+	var pkt packet
+	if err := pkt.UnmarshalText(msg); err != nil {
+		t.Fatalf("error unmarshaling packet: %v", err)
+	}
+	if pkt.typ != packetTypeOpen {
+		t.Errorf("expected packet type to be open (0), got %q", pkt.typ)
+	}
+	var c Conn
+	if err := json.Unmarshal([]byte(pkt.data.(string)), &c); err != nil {
+		t.Errorf("json unmarshal error: %v", err)
+	}
+	validateConn(c, t)
+	sent := "hello"
+	pkt.typ = packetTypeMessage
+	pkt.data = sent
+	b, err := pkt.MarshalText()
+	if err != nil {
+		t.Fatalf("error marshaling packet: %v", err)
+	}
+	if err := websocket.Message.Send(ws, b); err != nil {
+		t.Fatalf("unable to send message %q: %v", b, err)
+	}
+	if err := websocket.Message.Receive(ws, &msg); err != nil {
+		t.Fatalf("error receiving websocket message: %v", err)
+	}
+	if err := pkt.UnmarshalText(msg); err != nil {
+		t.Fatalf("error unmarshaling packet: %v", err)
+	}
+	if pkt.typ != packetTypeMessage || pkt.data.(string) != sent {
+		t.Errorf("original and returned packets don’t match. returned packet: %+v", pkt)
 	}
 }
