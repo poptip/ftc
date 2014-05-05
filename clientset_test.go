@@ -8,7 +8,7 @@ package ftc
 import "testing"
 
 func TestClientSetBasic(t *testing.T) {
-	s := newClientSet()
+	s := &clientSet{clients: map[string]*Conn{}}
 	c1 := &Conn{ID: "foo"}
 	c2 := &Conn{ID: "bar"}
 	c3 := &Conn{ID: "baz"}

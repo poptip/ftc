@@ -99,7 +99,7 @@ func newConn(pingInterval, pingTimeout int, transport string) *Conn {
 		state:        readyStateOpening,
 		send:         make(chan payload),
 		messages:     make(chan interface{}, 256),
-		closer:       make(chan struct{}, 1),
+		closer:       make(chan struct{}),
 		transport:    transport,
 	}
 }
@@ -272,9 +272,15 @@ func (c *Conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
-	var buf payload
+	var (
+		buf payload
+		ok  bool
+	)
 	select {
-	case buf = <-c.send:
+	case buf, ok = <-c.send:
+		if !ok {
+			buf = payload{newPacket(packetTypeClose, nil)}
+		}
 	case <-time.After(DefaultPingTimeout * time.Millisecond):
 		glog.Infof("GET timeout for Conn %p", c)
 		buf = payload{newPacket(packetTypeNoop, nil)}
@@ -301,9 +307,14 @@ func (c *Conn) webSocketListener() {
 		}
 		c.wsMu.RUnlock()
 	}(c)
+	send := c.send
+	closer := c.closer
 	for {
 		select {
-		case p := <-c.send:
+		case p, ok := <-send:
+			if !ok {
+				return
+			}
 			for _, pkt := range p {
 				c.wsMu.RLock()
 				err := sendWSPacket(c.ws, pkt)
@@ -313,7 +324,7 @@ func (c *Conn) webSocketListener() {
 					continue
 				}
 			}
-		case <-c.closer:
+		case <-closer:
 			return
 		}
 	}

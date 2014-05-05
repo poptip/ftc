@@ -14,11 +14,6 @@ type clientSet struct {
 	clients map[string]*Conn
 }
 
-// newClientSet allocates and returns a new clientSet.
-func newClientSet() *clientSet {
-	return &clientSet{clients: map[string]*Conn{}}
-}
-
 // get returns the connection with the given ID, nil otherwise.
 func (c *clientSet) get(id string) *Conn {
 	c.RLock()

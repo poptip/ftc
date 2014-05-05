@@ -33,12 +33,11 @@ type packet struct {
 
 // MarshalText encodes the packet into UTF-8-encoded text and returns the result.
 func (p *packet) MarshalText() ([]byte, error) {
-	if p.data == nil {
-		return []byte(p.typ), nil
-	}
 	switch t := p.data.(type) {
 	case string:
 		return []byte(p.typ + t), nil
+	case nil:
+		return []byte(p.typ), nil
 	default:
 		b, err := json.Marshal(t)
 		if err != nil {

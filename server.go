@@ -160,7 +160,7 @@ func NewServer(o *Options, h Handler) *server {
 		pingTimeout:    o.PingTimeout,
 		pingInterval:   o.PingInterval,
 		upgradeTimeout: o.UpgradeTimeout,
-		clients:        newClientSet(),
+		clients:        &clientSet{clients: map[string]*Conn{}},
 	}
 	go s.startReaper()
 	s.wsServer = &websocket.Server{Handler: s.wsMainHandler}
@@ -189,10 +189,7 @@ func receiveWSPacket(ws *websocket.Conn, pkt *packet) error {
 		return err
 	}
 	glog.Infoln("got websocket message", msg)
-	if err := pkt.UnmarshalText([]byte(msg)); err != nil {
-		return err
-	}
-	return nil
+	return pkt.UnmarshalText([]byte(msg))
 }
 
 // sendWSPacket marshals the given packet and sends it over the
@@ -206,10 +203,7 @@ func sendWSPacket(ws *websocket.Conn, pkt *packet) error {
 	if err != nil {
 		return err
 	}
-	if err := websocket.Message.Send(ws, string(b)); err != nil {
-		return err
-	}
-	return nil
+	return websocket.Message.Send(ws, string(b))
 }
 
 // handleWSPing send the appropriate response packet (pong) with the
@@ -220,10 +214,7 @@ func handleWSPing(pkt *packet, ws *websocket.Conn) error {
 	if err != nil {
 		return err
 	}
-	if err := websocket.Message.Send(ws, string(b)); err != nil {
-		return err
-	}
-	return nil
+	return websocket.Message.Send(ws, string(b))
 }
 
 // wsMainHandler continuously receives on the given WebSocket
