@@ -11,27 +11,27 @@ import "sync"
 // of their IDs.
 type clientSet struct {
 	sync.RWMutex
-	clients map[string]*Conn
+	clients map[string]*conn
 }
 
 // get returns the connection with the given ID, nil otherwise.
-func (c *clientSet) get(id string) *Conn {
+func (c *clientSet) get(id string) *conn {
 	c.RLock()
 	defer c.RUnlock()
 	return c.clients[id]
 }
 
 // add adds a connection to the set keyed off its ID field.
-func (c *clientSet) add(con *Conn) {
+func (c *clientSet) add(con *conn) {
 	c.Lock()
-	c.clients[con.ID] = con
+	c.clients[con.id] = con
 	c.Unlock()
 }
 
 // remove removes a connection from the set.
-func (c *clientSet) remove(con *Conn) {
+func (c *clientSet) remove(con *conn) {
 	c.Lock()
-	delete(c.clients, con.ID)
+	delete(c.clients, con.id)
 	c.Unlock()
 }
 

@@ -12,46 +12,33 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
-	"sync"
 	"testing"
 
 	"code.google.com/p/go.net/websocket"
 	"github.com/golang/glog"
 )
 
-var (
-	serverAddr string
-	ftcServer  *server
-	once       sync.Once
-)
-
-func startServer() {
-	// Basic echo testing server.
-	h := Handler(func(c *Conn) {
-		for {
-			var msg string
-			if err := c.Receive(&msg); err != nil {
-				glog.Errorf("receive: %v", err)
-				continue
-			}
-			if err := c.Send(msg); err != nil {
-				glog.Errorf("send: %v", err)
-			}
+var echoHandler = Handler(func(c Conn) {
+	for {
+		var msg string
+		if err := c.Receive(&msg); err != nil {
+			continue
 		}
-	})
-	ftcServer = NewServer(nil, h)
-	serverAddr = httptest.NewServer(ftcServer).Listener.Addr().String()
-	glog.Infoln("test server listening on", serverAddr)
-}
+		if err := c.Send(msg); err != nil {
+			glog.Errorf("send: %v", err)
+		}
+	}
+})
 
 func TestTransportParam(t *testing.T) {
-	once.Do(startServer)
+	ts := httptest.NewServer(NewServer(nil, echoHandler))
+	defer ts.Close()
 	testCases := map[string]int{
 		DefaultBasePath + "?transport=hyperloop": 400,
 		DefaultBasePath + "?transport=polling":   200,
 	}
 	for path, statusCode := range testCases {
-		resp, err := http.Get("http://" + serverAddr + path)
+		resp, err := http.Get(ts.URL + path)
 		if err != nil {
 			t.Error(err)
 		}
@@ -60,7 +47,8 @@ func TestTransportParam(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
-	ws, err := websocket.Dial("ws://"+serverAddr+DefaultBasePath+"?transport=websocket", "", "http://"+serverAddr)
+	serverAddr := ts.Listener.Addr().String()
+	ws, err := websocket.Dial("ws://"+serverAddr+DefaultBasePath+"?transport=websocket", "", ts.URL)
 	if err != nil {
 		t.Fatalf("websocket dial error: %v", err)
 	}
@@ -68,8 +56,9 @@ func TestTransportParam(t *testing.T) {
 }
 
 func TestBadSID(t *testing.T) {
-	once.Do(startServer)
-	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling&sid=test"
+	ts := httptest.NewServer(NewServer(nil, echoHandler))
+	defer ts.Close()
+	addr := ts.URL + DefaultBasePath + "?transport=polling&sid=test"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Error(err)
@@ -82,11 +71,12 @@ func TestBadSID(t *testing.T) {
 }
 
 func TestSetCookie(t *testing.T) {
-	original := ftcServer.cookieName
-	defer func(n string) { ftcServer.cookieName = n }(original)
+	ftcServer := NewServer(nil, echoHandler)
+	ts := httptest.NewServer(ftcServer)
+	defer ts.Close()
 	newName := "woot"
 	ftcServer.cookieName = newName
-	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling"
+	addr := ts.URL + DefaultBasePath + "?transport=polling"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Fatalf("http get error: %v", err)
@@ -107,25 +97,25 @@ func TestSetCookie(t *testing.T) {
 	}
 }
 
-func validateConn(c Conn, t *testing.T) {
-	if len(c.ID) == 0 {
+func validateConn(c *conn, s *server, t *testing.T) {
+	if len(c.id) == 0 {
 		t.Error("session id of conn is empty.")
 	}
-	for _, u := range c.Upgrades {
+	for _, u := range c.upgrades {
 		if !validUpgrades[u] {
 			t.Errorf("%s is not a valid upgrade.", u)
 		}
 	}
-	if c.PingInterval != ftcServer.pingInterval {
-		t.Errorf("ping intervals don’t match. client: %d; server: %d", c.PingInterval, ftcServer.pingInterval)
+	if c.pingInterval != s.pingInterval {
+		t.Errorf("ping intervals don’t match. client: %d; server: %d", c.pingInterval, s.pingInterval)
 	}
-	if c.PingTimeout != ftcServer.pingTimeout {
-		t.Errorf("ping timeouts don’t match. client: %d; server: %d", c.PingTimeout, ftcServer.pingTimeout)
+	if c.pingTimeout != s.pingTimeout {
+		t.Errorf("ping timeouts don’t match. client: %d; server: %d", c.pingTimeout, s.pingTimeout)
 	}
 }
 
-func handshakePolling(t *testing.T) string {
-	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling"
+func handshakePolling(url string, s *server, t *testing.T) string {
+	addr := url + DefaultBasePath + "?transport=polling"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Fatalf("http get error: %v", err)
@@ -142,23 +132,26 @@ func handshakePolling(t *testing.T) string {
 	if len(p) != 1 {
 		t.Fatalf("expected payload to have one packet. it has %d", len(p))
 	}
-	var c Conn
+	var c conn
 	if err := json.Unmarshal([]byte(p[0].data.(string)), &c); err != nil {
 		t.Fatalf("json unmarshal error: %v", err)
 	}
-	validateConn(c, t)
-	return c.ID
+	validateConn(&c, s, t)
+	return c.id
 }
 
 func TestXHRPolling(t *testing.T) {
-	sid := handshakePolling(t)
+	ftcServer := NewServer(nil, echoHandler)
+	ts := httptest.NewServer(ftcServer)
+	defer ts.Close()
+	sid := handshakePolling(ts.URL, ftcServer, t)
 	// Send a message.
 	p := payload{newPacket(packetTypeMessage, "hello")}
 	b, err := p.MarshalText()
 	if err != nil {
 		t.Fatalf("could not marshal payload: %v", err)
 	}
-	addr := "http://" + serverAddr + DefaultBasePath + "?transport=polling&sid=" + sid
+	addr := ts.URL + DefaultBasePath + "?transport=polling&sid=" + sid
 	resp, err := http.Post(addr, "text/plain;charset=UTF-8", bytes.NewBuffer(b))
 	if err != nil {
 		t.Fatalf("http post error: %v", err)
@@ -194,6 +187,10 @@ func TestXHRPolling(t *testing.T) {
 }
 
 func TestWebSockets(t *testing.T) {
+	ftcServer := NewServer(nil, echoHandler)
+	ts := httptest.NewServer(ftcServer)
+	defer ts.Close()
+	serverAddr := ts.Listener.Addr().String()
 	ws, err := websocket.Dial("ws://"+serverAddr+DefaultBasePath+"?transport=websocket", "", "http://"+serverAddr)
 	if err != nil {
 		t.Fatalf("websocket dial error: %v", err)
@@ -210,11 +207,11 @@ func TestWebSockets(t *testing.T) {
 	if pkt.typ != packetTypeOpen {
 		t.Errorf("expected packet type to be open (0), got %q", pkt.typ)
 	}
-	var c Conn
+	var c conn
 	if err := json.Unmarshal([]byte(pkt.data.(string)), &c); err != nil {
 		t.Errorf("json unmarshal error: %v", err)
 	}
-	validateConn(c, t)
+	validateConn(&c, ftcServer, t)
 	sent := "hello"
 	pkt.typ = packetTypeMessage
 	pkt.data = sent

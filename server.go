@@ -82,7 +82,7 @@ func getValidUpgrades() []string {
 
 // A Handler is called by the server when a connection is
 // opened successfully. An example echo handler is shown below.
-//   func EchoServer(c *ftc.Conn) {
+//   func EchoServer(c ftc.Conn) {
 //   	for {
 //   		var msg string
 //   		if err := c.Receive(&msg); err != nil {
@@ -96,7 +96,7 @@ func getValidUpgrades() []string {
 //   }
 // It can then be used in combination with NewServer as follows:
 //   http.Handle("/engine.io/", ftc.NewServer(nil, ftc.Handler(EchoServer)))
-type Handler func(*Conn)
+type Handler func(Conn)
 
 // A server represents a server of an FTC connection.
 type server struct {
@@ -160,7 +160,7 @@ func NewServer(o *Options, h Handler) *server {
 		pingTimeout:    o.PingTimeout,
 		pingInterval:   o.PingInterval,
 		upgradeTimeout: o.UpgradeTimeout,
-		clients:        &clientSet{clients: map[string]*Conn{}},
+		clients:        &clientSet{clients: map[string]*conn{}},
 	}
 	go s.startReaper()
 	s.wsServer = &websocket.Server{Handler: s.wsMainHandler}
@@ -221,7 +221,7 @@ func handleWSPing(pkt *packet, ws *websocket.Conn) error {
 // connection and delegates the packets received to the appropriate
 // handler functions.
 func (s *server) wsMainHandler(ws *websocket.Conn) {
-	var c *Conn
+	var c *conn
 	var sid string
 	for {
 		if len(sid) == 0 {
@@ -253,7 +253,7 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 
 		// Client has not been upgraded yet.
 		if c.ws != nil && c.ws != ws {
-			glog.Errorf("websocket already associated with session %s", c.ID)
+			glog.Errorf("websocket already associated with session %s", c.id)
 			break
 		}
 		c.ws = ws
@@ -280,6 +280,7 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 // a handshake if the request’s session ID does not already exist within
 // the client set.
 func (s *server) pollingHandler(w http.ResponseWriter, r *http.Request) {
+	setPollingHeaders(w, r)
 	sid := r.FormValue(paramSessionID)
 	if len(sid) > 0 {
 		socket := s.clients.get(sid)
@@ -307,12 +308,21 @@ func (s *server) wsHandshake(ws *websocket.Conn) string {
 	glog.Infof("starting websocket handshake. Handler: %+v", s.Handler)
 	c := newConn(s.pingInterval, s.pingTimeout, transportWebSocket)
 	s.clients.add(c)
-	c.wsOpen(ws)
+	err := c.open(ws)
+	if err != nil {
+		glog.Errorf("unable to open websocket connection: %v", err)
+	}
+	c.wsMu.Lock()
+	c.ws = ws
+	c.wsMu.Unlock()
+	c.upgraded = true
+	c.transport = transportWebSocket
+	go c.webSocketListener()
 
 	if s.Handler != nil {
 		go s.Handler(c)
 	}
-	return c.ID
+	return c.id
 }
 
 // pollingHandshake creates a new FTC Conn with the given HTTP Request and
@@ -324,13 +334,18 @@ func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
 	s.clients.add(c)
 
 	if len(s.cookieName) > 0 {
-		glog.Infoln("setting cookie:", s.cookieName, c.ID)
+		glog.Infoln("setting cookie:", s.cookieName, c.id)
 		http.SetCookie(w, &http.Cookie{
 			Name:  s.cookieName,
-			Value: c.ID,
+			Value: c.id,
 		})
 	}
-	c.pollingOpen(w, r)
+	err := c.open(w)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c.transport = transportPolling
 	glog.Infof("polling handleshake complete. calling Handler: %+v", s.Handler)
 	if s.Handler != nil {
 		go s.Handler(c)
@@ -353,10 +368,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	if transport == transportWebSocket {
 		s.wsServer.ServeHTTP(w, r)
-		return
+	} else if transport == transportPolling {
+		s.pollingHandler(w, r)
 	}
-
-	s.pollingHandler(w, r)
 }
 
 // serverError sends a JSON-encoded message to the given ResponseWriter
@@ -375,4 +389,18 @@ func serverError(w http.ResponseWriter, code int) {
 		glog.Errorln("error encoding error msg %+v: %s", msg, err)
 		return
 	}
+}
+
+// setPollingHeaders sets the appropriate headers when responding
+// to an XHR polling request.
+func setPollingHeaders(w http.ResponseWriter, r *http.Request) {
+	origin := r.Header.Get("Origin")
+	if len(origin) > 0 {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+	} else {
+		origin = "*"
+	}
+	w.Header().Set("Access-Control-Allow-Origin", origin)
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 }

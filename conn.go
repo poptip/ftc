@@ -7,13 +7,14 @@ package ftc
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"reflect"
 	"sync"
-	"time"
 
 	"code.google.com/p/go.net/websocket"
 	"github.com/dustin/randbo"
@@ -29,42 +30,91 @@ const (
 	messageProbe = "probe"
 )
 
+type Opener interface {
+	// open sends an "open" packet to w.
+	open(io.Writer) error
+}
+
+type Sender interface {
+	Send(v interface{}) error
+}
+
+type Receiver interface {
+	Receive(v interface{}) error
+}
+
+type Conn interface {
+	Opener
+	Sender
+	Receiver
+	io.ReadWriteCloser
+	json.Marshaler
+	json.Unmarshaler
+}
+
 // newID returns a pseudo-random, URL-encoded, base64
 // string used for connection identifiers.
 func newID() string {
 	buf := make([]byte, 15)
 	n, err := randbo.New().Read(buf)
 	if err != nil {
-		panic(err)
+		glog.Fatal(err)
 	}
 	if n != len(buf) {
-		panic("short read")
+		glog.Fatal("short read")
 	}
 	return base64.URLEncoding.EncodeToString(buf)
 }
 
-// A Conn represents an FTC connection.
-type Conn struct {
-	wsMu sync.RWMutex    `json:"-"`
-	ws   *websocket.Conn `json:"-"`
+// A conn represents an FTC connection.
+type conn struct {
+	wsMu sync.RWMutex
+	ws   *websocket.Conn
 
-	ID           string   `json:"sid"`
-	Upgrades     []string `json:"upgrades"`
-	PingInterval int      `json:"pingInterval"`
-	PingTimeout  int      `json:"pingTimeout"`
+	id           string
+	upgrades     []string
+	pingInterval int
+	pingTimeout  int
 
-	stateMu sync.RWMutex `json:"-"`
-	state   string       `json:"-"`
+	stateMu sync.RWMutex
+	state   string
 
-	transport string           `json:"-"`
-	upgraded  bool             `json:"-"`
-	send      chan payload     `json:"-"`
-	messages  chan interface{} `json:"-"`
-	closer    chan struct{}    `json:"-"`
+	transport string
+	upgraded  bool
+	send      chan payload
+	messages  chan interface{}
+}
+
+// MarshalJSON encodes the connection as a JSON object.
+func (c *conn) MarshalJSON() ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"sid":          c.id,
+		"upgrades":     getValidUpgrades(),
+		"pingInterval": c.pingInterval,
+		"pingTimeout":  c.pingTimeout,
+	})
+}
+
+// MarshalJSON decodes a JSON byte array into the connection receiver.
+func (c *conn) UnmarshalJSON(data []byte) error {
+	s := struct {
+		SID          string
+		Upgrades     []string
+		PingInterval int
+		PingTimeout  int
+	}{}
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	}
+	c.id = s.SID
+	c.upgrades = s.Upgrades
+	c.pingTimeout = s.PingTimeout
+	c.pingInterval = s.PingInterval
+	return nil
 }
 
 // Receive receives a single message from the connection into v.
-func (c *Conn) Receive(v interface{}) error {
+func (c *conn) Receive(v interface{}) error {
 	if c == nil {
 		return errors.New("attempt to receive on a nil connection")
 	}
@@ -78,7 +128,7 @@ func (c *Conn) Receive(v interface{}) error {
 }
 
 // Send sends v as a single message to the connection.
-func (c *Conn) Send(v interface{}) error {
+func (c *conn) Send(v interface{}) error {
 	if c == nil {
 		return errors.New("attempt to receive on a nil connection")
 	}
@@ -89,24 +139,23 @@ func (c *Conn) Send(v interface{}) error {
 	return nil
 }
 
-// newConn allocates and returns a Conn with the given options.
-func newConn(pingInterval, pingTimeout int, transport string) *Conn {
-	return &Conn{
-		ID:           newID(),
-		Upgrades:     getValidUpgrades(),
-		PingInterval: pingInterval,
-		PingTimeout:  pingTimeout,
+// newConn allocates and returns a conn with the given options.
+func newConn(pingInterval, pingTimeout int, transport string) *conn {
+	return &conn{
+		id:           newID(),
+		upgrades:     getValidUpgrades(),
+		pingInterval: pingInterval,
+		pingTimeout:  pingTimeout,
 		state:        readyStateOpening,
 		send:         make(chan payload),
 		messages:     make(chan interface{}, 256),
-		closer:       make(chan struct{}),
 		transport:    transport,
 	}
 }
 
 // readyState returns the current state of the connection. It is safe
 // to be called from multiple goroutines.
-func (c *Conn) readyState() string {
+func (c *conn) readyState() string {
 	c.stateMu.RLock()
 	defer c.stateMu.RUnlock()
 	return c.state
@@ -114,62 +163,63 @@ func (c *Conn) readyState() string {
 
 // setReadyState sets the current state of the connection. It is safe
 // to be called from multiple goroutines.
-func (c *Conn) setReadyState(s string) {
+func (c *conn) setReadyState(s string) {
 	c.stateMu.Lock()
 	c.state = s
 	c.stateMu.Unlock()
 }
 
-// wsOpen sends an "open" packet to the underlying WebSocket
-// connection and is used during the initial handshake process.
-func (c *Conn) wsOpen(ws *websocket.Conn) {
-	// TODO(andybons): ensure that this is only called once on a connection.
-	c.wsMu.Lock()
-	c.ws = ws
-	c.wsMu.Unlock()
-	b, err := newPacket(packetTypeOpen, c).MarshalText()
+// open sends an "open" packet to the underlying connection
+// and is used during the initial handshake process. If the
+// underlying connection is a http.ResponseWriter, it is
+// wrapped in a payload.
+func (c *conn) open(w io.Writer) error {
+	if c.readyState() == readyStateOpen {
+		return errors.New("connection is already open")
+	}
+	var (
+		b   []byte
+		err error
+	)
+	switch w.(type) {
+	case *websocket.Conn:
+		b, err = newPacket(packetTypeOpen, c).MarshalText()
+	case http.ResponseWriter:
+		payload := payload{newPacket(packetTypeOpen, c)}
+		b, err = payload.MarshalText()
+	}
 	if err != nil {
-		glog.Errorf("problem marshaling open payload: %v", err)
-		c.Close()
-		return
+		return err
 	}
-	if err := websocket.Message.Send(ws, string(b)); err != nil {
-		glog.Errorf("problem sending open payload: %v", err)
-		c.Close()
-		return
+	if _, err := fmt.Fprintf(w, "%s", b); err != nil {
+		return err
 	}
-	c.upgraded = true
 	c.setReadyState(readyStateOpen)
-	c.transport = transportWebSocket
-	go c.webSocketListener()
+	return nil
 }
 
-// pollingOpen sends an "open" packet to the underlying XHR polling
-// connection and is used during the initial handshake.
-func (c *Conn) pollingOpen(w http.ResponseWriter, r *http.Request) {
-	setPollingHeaders(w, r)
-	payload := payload{newPacket(packetTypeOpen, c)}
-	b, err := payload.MarshalText()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	fmt.Fprintf(w, "%s", b)
-	c.setReadyState(readyStateOpen)
+// Read implements the io.Reader interface and reads data from the FTC connection.
+func (c *conn) Read(msg []byte) (int, error) {
+	glog.Fatalln("not implemented")
+	return 0, nil
+}
+
+// Write implements the io.Writer interface and writes data to the FTC connection.
+func (c *conn) Write(msg []byte) (int, error) {
+	glog.Fatalln("not implemented")
+	return 0, nil
 }
 
 // Close closes the connection.
-func (c *Conn) Close() {
+func (c *conn) Close() error {
 	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
-		return
+		return errors.New("connection is already closed")
 	}
 	glog.Infof("closing ftc Connection %p", c)
 	c.setReadyState(readyStateClosing)
+
 	if c.send != nil {
 		close(c.send)
-	}
-	if c.closer != nil {
-		close(c.closer)
 	}
 	c.wsMu.Lock()
 	if c.ws != nil {
@@ -178,11 +228,12 @@ func (c *Conn) Close() {
 	}
 	c.wsMu.Unlock()
 	c.setReadyState(readyStateClosed)
+	return nil
 }
 
 // onPacket is called for each packet received by the connection
 // and responds to or dispatches the packets accordingly.
-func (c *Conn) onPacket(p *packet) {
+func (c *conn) onPacket(p *packet) {
 	if c.readyState() != readyStateOpen {
 		glog.Errorln("called on non-open connection")
 		return
@@ -203,7 +254,7 @@ func (c *Conn) onPacket(p *packet) {
 // onUpgrade is called when an upgrade packet is received and
 // the connection should be upgraded to use a WebSocket.
 // TODO(andybons): consolidate with wsOpen?
-func (c *Conn) onUpgrade(pkt *packet) {
+func (c *conn) onUpgrade(pkt *packet) {
 	glog.Infof("got upgrade packet: %+v", pkt)
 	if c.readyState() != readyStateOpen {
 		glog.Errorf("upgrade called with non-open ready state %s; packet: %+v", c.readyState(), pkt)
@@ -223,12 +274,12 @@ func (c *Conn) onUpgrade(pkt *packet) {
 // to be received by the client.
 // TODO(andybons): There is a chance that messages could fill up and
 // there would be no push-back from spawning unlimited goroutines.
-func (c *Conn) onMessage(data interface{}) {
+func (c *conn) onMessage(data interface{}) {
 	go func() { c.messages <- data }()
 }
 
 // sendPacket sends the given packet p to the connection.
-func (c *Conn) sendPacket(p *packet) {
+func (c *conn) sendPacket(p *packet) {
 	if c.readyState() != readyStateOpen {
 		glog.Errorln("called on non-open Connection")
 		return
@@ -241,7 +292,7 @@ func (c *Conn) sendPacket(p *packet) {
 // method request is received. It is expected that a payload is present
 // in the request body and is meant to serve as the method in which
 // clients can send FTC payloads to the server.
-func (c *Conn) pollingDataPost(w http.ResponseWriter, r *http.Request) {
+func (c *conn) pollingDataPost(w http.ResponseWriter, r *http.Request) {
 	glog.Infoln("XHR polling POST")
 	b, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -258,32 +309,23 @@ func (c *Conn) pollingDataPost(w http.ResponseWriter, r *http.Request) {
 	for _, pkt := range p {
 		c.onPacket(pkt)
 	}
-	setPollingHeaders(w, r)
 	fmt.Fprint(w, "ok")
 }
 
 // pollingDataGet is called on an XHR polling connection and is the "long polling"
-// aspect of the FTC connection. The request will wait until either a message is
-// ready to be sent back, or it will timeout according to the DefaultPingTimeout
-// constant. In the case of a timout, a no-op packet is sent to complete the request.
-func (c *Conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
+// aspect of the FTC connection. The request will block until a message is ready to
+// be sent back.
+func (c *conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
 	glog.Infoln("XHR polling GET")
 	if c.transport != transportPolling {
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		c.Close()
 		return
 	}
-	var (
-		buf payload
-		ok  bool
-	)
-	select {
-	case buf, ok = <-c.send:
-		if !ok {
-			buf = payload{newPacket(packetTypeClose, nil)}
-		}
-	case <-time.After(DefaultPingTimeout * time.Millisecond):
-		glog.Infof("GET timeout for Conn %p", c)
-		buf = payload{newPacket(packetTypeNoop, nil)}
+	buf, ok := <-c.send
+	if !ok {
+		c.Close()
+		return
 	}
 	glog.Infof("sending payload with %d packet(s)", len(buf))
 	b, err := buf.MarshalText()
@@ -291,55 +333,28 @@ func (c *Conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	setPollingHeaders(w, r)
 	fmt.Fprintf(w, "%s", b)
 }
 
 // webSocketListener continuously listens on the send channel for any
-// messages that need to be sent over the connection. It is shut down
-// by sending an empty struct to the closer channel.
-func (c *Conn) webSocketListener() {
-	glog.Infof("starting websocket listener for socket %s", c.ID)
-	defer func(c *Conn) {
-		c.wsMu.RLock()
-		if c.ws != nil {
-			c.ws.Close()
-		}
-		c.wsMu.RUnlock()
-	}(c)
+// messages that need to be sent over the connection. It will return
+// and close the underlying connection upon any error.
+func (c *conn) webSocketListener() {
+	glog.Infof("starting websocket listener for socket %s", c.id)
 	send := c.send
-	closer := c.closer
 	for {
-		select {
-		case p, ok := <-send:
-			if !ok {
-				return
-			}
-			for _, pkt := range p {
-				c.wsMu.RLock()
-				err := sendWSPacket(c.ws, pkt)
-				c.wsMu.RUnlock()
-				if err != nil {
-					glog.Errorln("websocket send error:", err)
-					continue
-				}
-			}
-		case <-closer:
+		p, ok := <-send
+		if !ok {
 			return
 		}
+		for _, pkt := range p {
+			c.wsMu.RLock()
+			err := sendWSPacket(c.ws, pkt)
+			c.wsMu.RUnlock()
+			if err != nil {
+				glog.Errorln("websocket send error:", err)
+				return
+			}
+		}
 	}
-}
-
-// setPollingHeaders sets the appropriate headers when responding
-// to an XHR polling request.
-func setPollingHeaders(w http.ResponseWriter, r *http.Request) {
-	origin := r.Header.Get("Origin")
-	if len(origin) > 0 {
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-	} else {
-		origin = "*"
-	}
-	w.Header().Set("Access-Control-Allow-Origin", origin)
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Content-Type", "text/plain; charset=UTF-8")
 }

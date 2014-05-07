@@ -80,7 +80,8 @@ type payload []*packet
 func (p *payload) MarshalText() ([]byte, error) {
 	str := ""
 	for _, pkt := range *p {
-		// TODO: JS uses utf-16 and go uses utf-8. Account for the length disparity.
+		// TODO: Integration tests. JS uses utf-16 and go uses utf-8.
+		// Account for the length disparity.
 		b, err := pkt.MarshalText()
 		if err != nil {
 			glog.Errorf("encoding: could not marshal packet %+v: %s", pkt, err)
