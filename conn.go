@@ -300,7 +300,6 @@ func (c *conn) pollingDataPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer r.Body.Close()
-	glog.Infoln(string(b))
 	var p payload
 	if err := p.UnmarshalText(b); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -327,7 +326,6 @@ func (c *conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
 		c.Close()
 		return
 	}
-	glog.Infof("sending payload with %d packet(s)", len(buf))
 	b, err := buf.MarshalText()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
