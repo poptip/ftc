@@ -221,10 +221,7 @@ func scanPacket(data []byte, atEOF bool) (int, []byte, error) {
 // decode reads the next encoded payload from its input
 // and stores it in the value pointed to by pkts.
 //
-// This method is not symmetrical with Encode, in that it
-// does not take an arbitrary type and fill its value. The
-// caller will always need the underlying packet type. This
-// method overwrites any existing data within pkts.
+// This method overwrites any existing data within pkts.
 func (dec *payloadDecoder) decode(pkts *[]packet) error {
 	scanner := bufio.NewScanner(dec.r)
 	scanner.Split(scanPacket)
