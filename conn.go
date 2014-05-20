@@ -7,50 +7,17 @@ package ftc
 
 import (
 	"encoding/base64"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
-	"io/ioutil"
-	"net/http"
-	"reflect"
 	"sync"
+	"time"
 
 	"code.google.com/p/go.net/websocket"
 	"github.com/dustin/randbo"
 	"github.com/golang/glog"
 )
 
-const (
-	readyStateOpening = "opening"
-	readyStateOpen    = "open"
-	readyStateClosing = "closing"
-	readyStateClosed  = "closed"
-
-	messageProbe = "probe"
-)
-
-type Opener interface {
-	// open sends an "open" packet to w.
-	open(io.Writer) error
-}
-
-type Sender interface {
-	Send(v interface{}) error
-}
-
-type Receiver interface {
-	Receive(v interface{}) error
-}
-
-type Conn interface {
-	Opener
-	Sender
-	Receiver
-	io.ReadWriteCloser
-	json.Marshaler
-	json.Unmarshaler
-}
+const defaultTimeout = 30 * time.Second
 
 // newID returns a pseudo-random, URL-encoded, base64
 // string used for connection identifiers.
@@ -66,293 +33,147 @@ func newID() string {
 	return base64.URLEncoding.EncodeToString(buf)
 }
 
-// A conn represents an FTC connection.
+// Conn represents an FTC connection.
+type Conn struct {
+	c    *conn
+	msgs chan []byte
+}
+
+func newPubConn(c *conn) *Conn {
+	return &Conn{c: c, msgs: make(chan []byte, 10)}
+}
+
+func (c *Conn) onMessage(msg []byte) {
+	select {
+	case c.msgs <- msg:
+		return
+	case <-time.After(defaultTimeout):
+		glog.Warningln("onMessage timed out")
+	}
+}
+
+func (c *Conn) Read(p []byte) (int, error) {
+	select {
+	case b := <-c.msgs:
+		return copy(p, b), nil
+	case <-time.After(defaultTimeout):
+		return 0, errors.New("timeout")
+	}
+}
+
+func (c *Conn) Write(p []byte) (int, error) {
+	pkt := packet{typ: packetTypeMessage, data: p}
+	if c.c.upgraded() {
+		return len(p), newPacketEncoder(c.c).encode(pkt)
+	}
+	return len(p), newPayloadEncoder(c.c).encode([]packet{pkt})
+}
+
+func (c *Conn) Close() error {
+	err := c.c.Close()
+	c.c = nil
+	return err
+}
+
+// conn represents an internal FTC connection.
+// The publicly available Conn abstracts away the
+// underlying protocol by only sending message data
+// through Read/Write. If a conn is using a WebSocket
+// connection as its underlying transport mechanism,
+// then reads and writes go directly to that connection.
+// Otherwise (XHR long polling) they are pushed onto
+// a buffered channel by a POST to be read later by
+// a subsequent GET.
 type conn struct {
-	wsMu sync.RWMutex
-	ws   *websocket.Conn
+	id      string      // A unique ID assigned to the conn.
+	buf     chan []byte // Storage buffer for messages.
+	pubConn *Conn       // Public connection that only reads and writes message data.
 
-	id           string
-	upgrades     []string
-	pingInterval int
-	pingTimeout  int
-
-	stateMu sync.RWMutex
-	state   string
-
-	transport string
-	upgraded  bool
-	send      chan payload
-	messages  chan interface{}
+	mu     sync.RWMutex    // Protects the items below.
+	ws     *websocket.Conn // If upgraded, used to send and receive messages.
+	closed bool            // Whether the connection is closed.
 }
 
-// MarshalJSON encodes the connection as a JSON object.
-func (c *conn) MarshalJSON() ([]byte, error) {
-	return json.Marshal(map[string]interface{}{
-		"sid":          c.id,
-		"upgrades":     getValidUpgrades(),
-		"pingInterval": c.pingInterval,
-		"pingTimeout":  c.pingTimeout,
-	})
+// newConn allocates and returns a new FTC connection.
+func newConn() *conn {
+	c := &conn{
+		id:  newID(),
+		buf: make(chan []byte, 10),
+	}
+	c.pubConn = newPubConn(c)
+	return c
 }
 
-// MarshalJSON decodes a JSON byte array into the connection receiver.
-func (c *conn) UnmarshalJSON(data []byte) error {
-	s := struct {
-		SID          string
-		Upgrades     []string
-		PingInterval int
-		PingTimeout  int
-	}{}
-	if err := json.Unmarshal(data, &s); err != nil {
-		return err
+// Read copies the next available message to the given
+// byte slice. If no message is available, it will block.
+func (c *conn) Read(p []byte) (int, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return 0, errors.New("cannot read on closed connection")
 	}
-	c.id = s.SID
-	c.upgrades = s.Upgrades
-	c.pingTimeout = s.PingTimeout
-	c.pingInterval = s.PingInterval
-	return nil
-}
-
-// Receive receives a single message from the connection into v.
-func (c *conn) Receive(v interface{}) error {
-	if c == nil {
-		return errors.New("attempt to receive on a nil connection")
+	if c.ws != nil {
+		// TODO(andybons): return io.EOF as the error to play nicely with io funcs.
+		return c.ws.Read(p)
 	}
-	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
-		return errors.New("attempt to receive on a closed connection")
-	}
-	msg := <-c.messages
-	// TODO(andybons): Error checking for proper values.
-	reflect.ValueOf(v).Elem().Set(reflect.ValueOf(msg))
-	return nil
-}
-
-// Send sends v as a single message to the connection.
-func (c *conn) Send(v interface{}) error {
-	if c == nil {
-		return errors.New("attempt to receive on a nil connection")
-	}
-	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
-		return errors.New("attempt to receive on a closed connection")
-	}
-	c.send <- payload{newPacket(packetTypeMessage, v)}
-	return nil
-}
-
-// newConn allocates and returns a conn with the given options.
-func newConn(pingInterval, pingTimeout int, transport string) *conn {
-	return &conn{
-		id:           newID(),
-		upgrades:     getValidUpgrades(),
-		pingInterval: pingInterval,
-		pingTimeout:  pingTimeout,
-		state:        readyStateOpening,
-		send:         make(chan payload),
-		messages:     make(chan interface{}, 256),
-		transport:    transport,
+	select {
+	case b := <-c.buf:
+		return copy(p, b), io.EOF
+	case <-time.After(defaultTimeout):
+		return 0, errors.New("timeout")
 	}
 }
 
-// readyState returns the current state of the connection. It is safe
-// to be called from multiple goroutines.
-func (c *conn) readyState() string {
-	c.stateMu.RLock()
-	defer c.stateMu.RUnlock()
-	return c.state
-}
-
-// setReadyState sets the current state of the connection. It is safe
-// to be called from multiple goroutines.
-func (c *conn) setReadyState(s string) {
-	c.stateMu.Lock()
-	c.state = s
-	c.stateMu.Unlock()
-}
-
-// open sends an "open" packet to the underlying connection
-// and is used during the initial handshake process. If the
-// underlying connection is a http.ResponseWriter, it is
-// wrapped in a payload.
-func (c *conn) open(w io.Writer) error {
-	if c.readyState() == readyStateOpen {
-		return errors.New("connection is already open")
+// Write writes the contents of p as a single message to
+// the connection. This call may block if the number of
+// outstanding writes exceeds the size of buf.
+func (c *conn) Write(p []byte) (int, error) {
+	glog.Infof("writing %q (upgraded: %t)", p, c.upgraded())
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.closed {
+		return 0, errors.New("cannot write on closed connection")
 	}
-	var (
-		b   []byte
-		err error
-	)
-	switch w.(type) {
-	case *websocket.Conn:
-		b, err = newPacket(packetTypeOpen, c).MarshalText()
-	case http.ResponseWriter:
-		payload := payload{newPacket(packetTypeOpen, c)}
-		b, err = payload.MarshalText()
+	if c.ws != nil {
+		return c.ws.Write(p)
 	}
-	if err != nil {
-		return err
+	select {
+	case c.buf <- p:
+		return len(p), nil
+	case <-time.After(defaultTimeout):
+		return 0, errors.New("timeout")
 	}
-	if _, err := fmt.Fprintf(w, "%s", b); err != nil {
-		return err
-	}
-	c.setReadyState(readyStateOpen)
-	return nil
-}
-
-// Read implements the io.Reader interface and reads data from the FTC connection.
-func (c *conn) Read(msg []byte) (int, error) {
-	glog.Fatalln("not implemented")
-	return 0, nil
-}
-
-// Write implements the io.Writer interface and writes data to the FTC connection.
-func (c *conn) Write(msg []byte) (int, error) {
-	glog.Fatalln("not implemented")
-	return 0, nil
 }
 
 // Close closes the connection.
 func (c *conn) Close() error {
-	if c.readyState() == readyStateClosing || c.readyState() == readyStateClosed {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
 		return errors.New("connection is already closed")
 	}
-	glog.Infof("closing ftc Connection %p", c)
-	c.setReadyState(readyStateClosing)
-
-	if c.send != nil {
-		close(c.send)
-	}
-	c.wsMu.Lock()
+	close(c.buf)
+	close(c.pubConn.msgs)
 	if c.ws != nil {
-		c.Close()
-		c.ws = nil
+		c.ws.Close()
 	}
-	c.wsMu.Unlock()
-	c.setReadyState(readyStateClosed)
+	c.closed = true
 	return nil
 }
 
-// onPacket is called for each packet received by the connection
-// and responds to or dispatches the packets accordingly.
-func (c *conn) onPacket(p *packet) {
-	if c.readyState() != readyStateOpen {
-		glog.Errorln("called on non-open connection")
-		return
-	}
-	glog.Infoln("got packet:", *p)
-	switch p.typ {
-	case packetTypePing:
-		c.sendPacket(newPacket(packetTypePong, p.data))
-	case packetTypeMessage:
-		c.onMessage(p.data)
-	case packetTypeUpgrade:
-		c.onUpgrade(p)
-	case packetTypeClose:
-		c.Close()
-	}
+// upgrade assigns the given WebSocket connection to
+// the connection.
+// TODO(andybons): Flush any messages waiting in buf and close it.
+func (c *conn) upgrade(ws *websocket.Conn) {
+	glog.Infoln("upgrading connection...")
+	c.mu.Lock()
+	c.ws = ws
+	c.mu.Unlock()
 }
 
-// onUpgrade is called when an upgrade packet is received and
-// the connection should be upgraded to use a WebSocket.
-// TODO(andybons): consolidate with wsOpen?
-func (c *conn) onUpgrade(pkt *packet) {
-	glog.Infof("got upgrade packet: %+v", pkt)
-	if c.readyState() != readyStateOpen {
-		glog.Errorf("upgrade called with non-open ready state %s; packet: %+v", c.readyState(), pkt)
-		return
-	}
-	if c.upgraded && c.transport == transportWebSocket {
-		glog.Warningf("transport already upgraded: %+v", pkt)
-		return
-	}
-	c.upgraded = true
-	c.transport = transportWebSocket
-	go c.webSocketListener()
-}
-
-// onMessage is called when a message packet is received.
-// It then sends the data to the buffered messages channel
-// to be received by the client.
-// TODO(andybons): There is a chance that messages could fill up and
-// there would be no push-back from spawning unlimited goroutines.
-func (c *conn) onMessage(data interface{}) {
-	go func() { c.messages <- data }()
-}
-
-// sendPacket sends the given packet p to the connection.
-func (c *conn) sendPacket(p *packet) {
-	if c.readyState() != readyStateOpen {
-		glog.Errorln("called on non-open Connection")
-		return
-	}
-	glog.Infoln("sending packet:", *p)
-	c.send <- payload{p}
-}
-
-// pollingDataPost is called on an XHR polling connection when a POST
-// method request is received. It is expected that a payload is present
-// in the request body and is meant to serve as the method in which
-// clients can send FTC payloads to the server.
-func (c *conn) pollingDataPost(w http.ResponseWriter, r *http.Request) {
-	glog.Infoln("XHR polling POST")
-	b, err := ioutil.ReadAll(r.Body)
-	if err != nil {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		return
-	}
-	defer r.Body.Close()
-	var p payload
-	if err := p.UnmarshalText(b); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-	for _, pkt := range p {
-		c.onPacket(pkt)
-	}
-	fmt.Fprint(w, "ok")
-}
-
-// pollingDataGet is called on an XHR polling connection and is the "long polling"
-// aspect of the FTC connection. The request will block until a message is ready to
-// be sent back.
-func (c *conn) pollingDataGet(w http.ResponseWriter, r *http.Request) {
-	glog.Infoln("XHR polling GET")
-	if c.transport != transportPolling {
-		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
-		c.Close()
-		return
-	}
-	buf, ok := <-c.send
-	if !ok {
-		c.Close()
-		return
-	}
-	b, err := buf.MarshalText()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	fmt.Fprintf(w, "%s", b)
-}
-
-// webSocketListener continuously listens on the send channel for any
-// messages that need to be sent over the connection. It will return
-// and close the underlying connection upon any error.
-func (c *conn) webSocketListener() {
-	glog.Infof("starting websocket listener for socket %s", c.id)
-	send := c.send
-	for {
-		p, ok := <-send
-		if !ok {
-			return
-		}
-		for _, pkt := range p {
-			c.wsMu.RLock()
-			err := sendWSPacket(c.ws, pkt)
-			c.wsMu.RUnlock()
-			if err != nil {
-				glog.Errorln("websocket send error:", err)
-				return
-			}
-		}
-	}
+// upgraded returns true if the connection has been upgraded.
+func (c *conn) upgraded() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.ws != nil
 }

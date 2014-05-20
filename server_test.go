@@ -8,6 +8,7 @@ package ftc
 import (
 	"bytes"
 	"encoding/json"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
@@ -15,27 +16,21 @@ import (
 	"testing"
 
 	"code.google.com/p/go.net/websocket"
-	"github.com/golang/glog"
 )
 
-var echoHandler = Handler(func(c Conn) {
+var echoHandler = Handler(func(c *Conn) {
 	for {
-		var msg string
-		if err := c.Receive(&msg); err != nil {
-			continue
-		}
-		if err := c.Send(msg); err != nil {
-			glog.Errorf("send: %v", err)
-		}
+		io.Copy(c, c)
 	}
+	c.Close()
 })
 
 func TestTransportParam(t *testing.T) {
-	ts := httptest.NewServer(NewServer(nil, echoHandler))
+	ts := httptest.NewServer(NewServer(nil, nil))
 	defer ts.Close()
 	testCases := map[string]int{
-		DefaultBasePath + "?transport=hyperloop": 400,
-		DefaultBasePath + "?transport=polling":   200,
+		defaultBasePath + "?transport=hyperloop": 400,
+		defaultBasePath + "?transport=polling":   200,
 	}
 	for path, statusCode := range testCases {
 		resp, err := http.Get(ts.URL + path)
@@ -48,7 +43,7 @@ func TestTransportParam(t *testing.T) {
 		resp.Body.Close()
 	}
 	serverAddr := ts.Listener.Addr().String()
-	ws, err := websocket.Dial("ws://"+serverAddr+DefaultBasePath+"?transport=websocket", "", ts.URL)
+	ws, err := websocket.Dial("ws://"+serverAddr+defaultBasePath+"?transport=websocket", "", ts.URL)
 	if err != nil {
 		t.Fatalf("websocket dial error: %v", err)
 	}
@@ -56,9 +51,9 @@ func TestTransportParam(t *testing.T) {
 }
 
 func TestBadSID(t *testing.T) {
-	ts := httptest.NewServer(NewServer(nil, echoHandler))
+	ts := httptest.NewServer(NewServer(nil, nil))
 	defer ts.Close()
-	addr := ts.URL + DefaultBasePath + "?transport=polling&sid=test"
+	addr := ts.URL + defaultBasePath + "?transport=polling&sid=test"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Error(err)
@@ -71,12 +66,12 @@ func TestBadSID(t *testing.T) {
 }
 
 func TestSetCookie(t *testing.T) {
-	ftcServer := NewServer(nil, echoHandler)
+	ftcServer := NewServer(nil, nil)
 	ts := httptest.NewServer(ftcServer)
 	defer ts.Close()
 	newName := "woot"
 	ftcServer.cookieName = newName
-	addr := ts.URL + DefaultBasePath + "?transport=polling"
+	addr := ts.URL + defaultBasePath + "?transport=polling"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Fatalf("http get error: %v", err)
@@ -97,47 +92,31 @@ func TestSetCookie(t *testing.T) {
 	}
 }
 
-func validateConn(c *conn, s *server, t *testing.T) {
-	if len(c.id) == 0 {
-		t.Error("session id of conn is empty.")
-	}
-	for _, u := range c.upgrades {
-		if !validUpgrades[u] {
-			t.Errorf("%s is not a valid upgrade.", u)
-		}
-	}
-	if c.pingInterval != s.pingInterval {
-		t.Errorf("ping intervals don’t match. client: %d; server: %d", c.pingInterval, s.pingInterval)
-	}
-	if c.pingTimeout != s.pingTimeout {
-		t.Errorf("ping timeouts don’t match. client: %d; server: %d", c.pingTimeout, s.pingTimeout)
-	}
-}
-
 func handshakePolling(url string, s *server, t *testing.T) string {
-	addr := url + DefaultBasePath + "?transport=polling"
+	addr := url + defaultBasePath + "?transport=polling"
 	resp, err := http.Get(addr)
 	if err != nil {
 		t.Fatalf("http get error: %v", err)
 	}
 	defer resp.Body.Close()
-	b, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("could not read response body: %v", err)
+	var payload []packet
+	if err := newPayloadDecoder(resp.Body).decode(&payload); err != nil {
+		t.Fatalf("could not decode payload from response body: %v", err)
 	}
-	var p payload
-	if err := p.UnmarshalText(b); err != nil {
-		t.Fatalf("could not unmarshal response into payload: %v", err)
+	if len(payload) != 1 {
+		t.Fatalf("expected payload to have one packet. it has %d", len(payload))
 	}
-	if len(p) != 1 {
-		t.Fatalf("expected payload to have one packet. it has %d", len(p))
-	}
-	var c conn
-	if err := json.Unmarshal([]byte(p[0].data.(string)), &c); err != nil {
+	m := map[string]interface{}{}
+	if err := json.Unmarshal(payload[0].data, &m); err != nil {
 		t.Fatalf("json unmarshal error: %v", err)
 	}
-	validateConn(&c, s, t)
-	return c.id
+	for _, v := range m["upgrades"].([]interface{}) {
+		u := v.(string)
+		if !validUpgrades[u] {
+			t.Errorf("%s is not a valid upgrade.", u)
+		}
+	}
+	return m["sid"].(string)
 }
 
 func TestXHRPolling(t *testing.T) {
@@ -146,23 +125,24 @@ func TestXHRPolling(t *testing.T) {
 	defer ts.Close()
 	sid := handshakePolling(ts.URL, ftcServer, t)
 	// Send a message.
-	p := payload{newPacket(packetTypeMessage, "hello")}
-	b, err := p.MarshalText()
-	if err != nil {
-		t.Fatalf("could not marshal payload: %v", err)
+	p := []packet{packet{typ: packetTypeMessage, data: []byte("hello")}}
+	buf := bytes.NewBuffer([]byte{})
+	if err := newPayloadEncoder(buf).encode(p); err != nil {
+		t.Fatalf("could not encode payload: %v", err)
 	}
-	addr := ts.URL + DefaultBasePath + "?transport=polling&sid=" + sid
-	resp, err := http.Post(addr, "text/plain;charset=UTF-8", bytes.NewBuffer(b))
+	addr := ts.URL + defaultBasePath + "?transport=polling&sid=" + sid
+	resp, err := http.Post(addr, "text/plain;charset=UTF-8", buf)
 	if err != nil {
 		t.Fatalf("http post error: %v", err)
 	}
 	defer resp.Body.Close()
-	b, err = ioutil.ReadAll(resp.Body)
+	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		t.Fatalf("could not read post response body: %v", err)
 	}
-	if string(b) != "ok" {
-		t.Errorf("expected post response to be \"ok\", was %q", b)
+	expected := "ok"
+	if string(b) != expected {
+		t.Errorf("expected post response to be %q, was %q", expected, b)
 	}
 	// Receive a message.
 	resp, err = http.Get(addr)
@@ -170,18 +150,14 @@ func TestXHRPolling(t *testing.T) {
 		t.Fatalf("http get error: %+v", err)
 	}
 	defer resp.Body.Close()
-	b, err = ioutil.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("could not read get response body: %v", err)
-	}
-	var msg payload
-	if err := msg.UnmarshalText(b); err != nil {
-		t.Fatalf("could not unmarshal %q into payload: %v", b, err)
+	var msg []packet
+	if err := newPayloadDecoder(resp.Body).decode(&msg); err != nil {
+		t.Fatalf("could not decode response body: %v", err)
 	}
 	if len(msg) != len(p) {
 		t.Errorf("differing lengths of payloads: original: %d; response: %d", len(msg), len(p))
 	}
-	if msg[0].typ != p[0].typ || msg[0].data.(string) != msg[0].data.(string) {
+	if msg[0].typ != p[0].typ || !bytes.Equal(msg[0].data, p[0].data) {
 		t.Errorf("mismatch of packets: %+v and %+v", msg[0], p[0])
 	}
 }
@@ -191,44 +167,37 @@ func TestWebSockets(t *testing.T) {
 	ts := httptest.NewServer(ftcServer)
 	defer ts.Close()
 	serverAddr := ts.Listener.Addr().String()
-	ws, err := websocket.Dial("ws://"+serverAddr+DefaultBasePath+"?transport=websocket", "", "http://"+serverAddr)
+	ws, err := websocket.Dial("ws://"+serverAddr+defaultBasePath+"?transport=websocket", "", "http://"+serverAddr)
 	if err != nil {
 		t.Fatalf("websocket dial error: %v", err)
 	}
 	defer ws.Close()
-	var msg []byte
-	if err := websocket.Message.Receive(ws, &msg); err != nil {
-		t.Fatalf("error receiving websocket message: %v", err)
-	}
 	var pkt packet
-	if err := pkt.UnmarshalText(msg); err != nil {
-		t.Fatalf("error unmarshaling packet: %v", err)
+	if err := newPacketDecoder(ws).decode(&pkt); err != nil {
+		t.Fatalf("could not decode packet: %v", err)
 	}
 	if pkt.typ != packetTypeOpen {
 		t.Errorf("expected packet type to be open (0), got %q", pkt.typ)
 	}
-	var c conn
-	if err := json.Unmarshal([]byte(pkt.data.(string)), &c); err != nil {
-		t.Errorf("json unmarshal error: %v", err)
+	m := map[string]interface{}{}
+	if err := json.Unmarshal(pkt.data, &m); err != nil {
+		t.Fatalf("json unmarshal error: %v", err)
 	}
-	validateConn(&c, ftcServer, t)
-	sent := "hello"
-	pkt.typ = packetTypeMessage
-	pkt.data = sent
-	b, err := pkt.MarshalText()
-	if err != nil {
-		t.Fatalf("error marshaling packet: %v", err)
+	for _, v := range m["upgrades"].([]interface{}) {
+		u := v.(string)
+		if !validUpgrades[u] {
+			t.Errorf("%s is not a valid upgrade.", u)
+		}
 	}
-	if err := websocket.Message.Send(ws, b); err != nil {
-		t.Fatalf("unable to send message %q: %v", b, err)
+	sent := []byte("hello")
+	pkt = packet{typ: packetTypeMessage, data: sent}
+	if err := newPacketEncoder(ws).encode(pkt); err != nil {
+		t.Fatalf("unable to send websocket message %q: %v", sent, err)
 	}
-	if err := websocket.Message.Receive(ws, &msg); err != nil {
-		t.Fatalf("error receiving websocket message: %v", err)
+	if err := newPacketDecoder(ws).decode(&pkt); err != nil {
+		t.Fatalf("error decoding websocket message: %v", err)
 	}
-	if err := pkt.UnmarshalText(msg); err != nil {
-		t.Fatalf("error unmarshaling packet: %v", err)
-	}
-	if pkt.typ != packetTypeMessage || pkt.data.(string) != sent {
+	if pkt.typ != packetTypeMessage || !bytes.Equal(pkt.data, sent) {
 		t.Errorf("original and returned packets don’t match. returned packet: %+v", pkt)
 	}
 }

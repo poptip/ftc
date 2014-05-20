@@ -9,9 +9,9 @@ import "testing"
 
 func TestClientSetBasic(t *testing.T) {
 	s := &clientSet{clients: map[string]*conn{}}
-	c1 := &conn{id: "foo"}
-	c2 := &conn{id: "bar"}
-	c3 := &conn{id: "baz"}
+	c1 := newConn()
+	c2 := newConn()
+	c3 := newConn()
 	s.add(c1)
 	s.add(c2)
 	s.add(c3)
@@ -21,7 +21,7 @@ func TestClientSetBasic(t *testing.T) {
 	if s.get(c1.id) != c1 {
 		t.Errorf("expected conn with ID %s, got %+v", c1.id, s.get(c1.id))
 	}
-	c3.setReadyState(readyStateClosed)
+	c3.Close()
 	s.reap()
 	c := s.get(c3.id)
 	if c != nil || s.len() != 2 {
@@ -31,5 +31,15 @@ func TestClientSetBasic(t *testing.T) {
 	c = s.get(c1.id)
 	if c != nil || s.len() != 1 {
 		t.Errorf("expected conn with ID %s to be removed, got %+v", c1.id, c)
+	}
+}
+
+func TestAddingEmptyID(t *testing.T) {
+	s := &clientSet{clients: map[string]*conn{}}
+	c := newConn()
+	c.id = ""
+	s.add(c)
+	if r := s.get(c.id); r != nil {
+		t.Errorf("expected connection with empty id to not be added. got %+v", r)
 	}
 }

@@ -3,7 +3,6 @@
 // license that can be found in the LICENSE file.
 // Source code and contact info at http://github.com/poptip/ftc
 
-// Package ftc implements an engine.io-compatible server for persistent client-server connections.
 package ftc
 
 import (
@@ -14,19 +13,12 @@ import (
 	"net/http"
 	"strings"
 	"time"
-
 	"code.google.com/p/go.net/websocket"
+
 	"github.com/golang/glog"
 )
 
-// The defaults for options passed to the server.
-const (
-	DefaultBasePath       = "/engine.io/"
-	DefaultCookieName     = "io"
-	DefaultPingTimeout    = 60000
-	DefaultPingInterval   = 25000
-	DefaultUpgradeTimeout = 10000
-)
+var numClients = expvar.NewInt("num_clients")
 
 const (
 	// Protocol error codes and mappings.
@@ -36,9 +28,8 @@ const (
 	errorBadRequest         = 3
 
 	// Query parameters used in client requests.
-	paramTransport          = "transport"
-	paramSessionID          = "sid"
-	paramJSONPResponseIndex = "j"
+	paramTransport = "transport"
+	paramSessionID = "sid"
 
 	// Available transports.
 	transportWebSocket = "websocket"
@@ -66,8 +57,6 @@ var (
 	}
 )
 
-var numClients = expvar.NewInt("num_clients")
-
 // getValidUpgrades returns a slice containing the valid protocols
 // that a connection can upgrade to.
 func getValidUpgrades() []string {
@@ -82,23 +71,15 @@ func getValidUpgrades() []string {
 
 // A Handler is called by the server when a connection is
 // opened successfully. An example echo handler is shown below.
-//   func EchoServer(c ftc.Conn) {
-//   	for {
-//   		var msg string
-//   		if err := c.Receive(&msg); err != nil {
-//   			log.Printf("receive: %v", err)
-//   			continue
-//   		}
-//   		if err := c.Send(msg); err != nil {
-//   			log.Printf("send: %v", err)
-//   		}
-//   	}
+//   func EchoServer(c *ftc.conn) {
+//     for {
+//       io.Copy(c, c)
+//     }
 //   }
 // It can then be used in combination with NewServer as follows:
 //   http.Handle("/engine.io/", ftc.NewServer(nil, ftc.Handler(EchoServer)))
-type Handler func(Conn)
+type Handler func(*Conn)
 
-// A server represents a server of an FTC connection.
 type server struct {
 	// Handler handles an FTC connection.
 	Handler
@@ -106,13 +87,15 @@ type server struct {
 	basePath   string
 	cookieName string
 
-	pingTimeout    int
-	pingInterval   int
-	upgradeTimeout int
-
 	clients  *clientSet        // The set of connections (some may be closed).
 	wsServer *websocket.Server // The underlying WebSocket server.
 }
+
+// The defaults for options passed to the server.
+const (
+	defaultBasePath   = "/engine.io/"
+	defaultCookieName = "io"
+)
 
 // Options are the parameters passed to the server.
 type Options struct {
@@ -120,50 +103,30 @@ type Options struct {
 	BasePath string
 	// CookieName is the name of the cookie set upon successful handshake.
 	CookieName string
-	// DisableCookie is true if no cookies should be set upon handshake.
-	DisableCookie bool
-	// PingTimeout is how long a ping packet can hang before the Conn is considered closed.
-	PingTimeout int
-	// PingInterval specifies how often a ping packet should be sent to the server.
-	PingInterval int
-	// UpgradeTimeout specifies the maximum time an upgrade can take.
-	UpgradeTimeout int
 }
 
 // NewServer allocates and returns a new server with the given
 // options and handler. If nil options are passed, the defaults
 // specified in the constants above are used instead.
 func NewServer(o *Options, h Handler) *server {
-	if o == nil {
-		o = &Options{}
+	opts := Options{}
+	if o != nil {
+		opts = *o
 	}
-	if len(o.BasePath) == 0 {
-		o.BasePath = DefaultBasePath
+	if len(opts.BasePath) == 0 {
+		opts.BasePath = defaultBasePath
 	}
-	if len(o.CookieName) == 0 && !o.DisableCookie {
-		o.CookieName = DefaultCookieName
+	if len(opts.CookieName) == 0 {
+		opts.CookieName = defaultCookieName
 	}
-	if o.PingInterval == 0 {
-		o.PingInterval = DefaultPingInterval
-	}
-	if o.PingTimeout == 0 {
-		o.PingTimeout = DefaultPingTimeout
-	}
-	if o.UpgradeTimeout == 0 {
-		o.UpgradeTimeout = DefaultUpgradeTimeout
-	}
-
 	s := &server{
-		Handler:        h,
-		basePath:       o.BasePath,
-		cookieName:     o.CookieName,
-		pingTimeout:    o.PingTimeout,
-		pingInterval:   o.PingInterval,
-		upgradeTimeout: o.UpgradeTimeout,
-		clients:        &clientSet{clients: map[string]*conn{}},
+		Handler:    h,
+		basePath:   opts.BasePath,
+		cookieName: opts.CookieName,
+		clients:    &clientSet{clients: map[string]*conn{}},
 	}
 	go s.startReaper()
-	s.wsServer = &websocket.Server{Handler: s.wsMainHandler}
+	s.wsServer = &websocket.Server{Handler: s.wsHandler}
 	return s
 }
 
@@ -171,7 +134,6 @@ func NewServer(o *Options, h Handler) *server {
 // client set via the reap function.
 func (s *server) startReaper() {
 	for {
-		// TODO(andybons): does this need to be protected by a mutex?
 		if s.clients == nil {
 			glog.Fatal("server cannot have a nil client set")
 		}
@@ -181,95 +143,104 @@ func (s *server) startReaper() {
 	}
 }
 
-// receiveWSPacket calls receive on the given WebSocket connection
-// and unmarshals it into the given packet.
-func receiveWSPacket(ws *websocket.Conn, pkt *packet) error {
-	var msg string
-	if err := websocket.Message.Receive(ws, &msg); err != nil {
-		return err
+// handlePacket takes the given packet and writes the appropriate
+// response to the given connection.
+func (s *server) handlePacket(p packet, c *conn) error {
+	glog.Infof("handling packet type: %c, data: %s, upgraded: %t", p.typ, p.data, c.upgraded())
+	var encode func(packet) error
+	if c.upgraded() {
+		encode = newPacketEncoder(c).encode
+	} else {
+		encode = func(pkt packet) error {
+			return newPayloadEncoder(c).encode([]packet{pkt})
+		}
 	}
-	glog.Infoln("got websocket message", msg)
-	return pkt.UnmarshalText([]byte(msg))
+	switch p.typ {
+	case packetTypePing:
+		return encode(packet{typ: packetTypePong, data: p.data})
+	case packetTypeMessage:
+		if c.pubConn != nil {
+			c.pubConn.onMessage(p.data)
+		}
+	case packetTypeClose:
+		c.Close()
+	}
+	return nil
 }
 
-// sendWSPacket marshals the given packet and sends it over the
-// given WebSocket connection.
-func sendWSPacket(ws *websocket.Conn, pkt *packet) error {
-	if ws == nil || pkt == nil {
-		return fmt.Errorf("nil websocket or packet ws: %+v, pkt: %+v", ws, pkt)
-	}
-	glog.Infof("sending websocket packet: %+v", pkt)
-	b, err := pkt.MarshalText()
-	if err != nil {
-		return err
-	}
-	return websocket.Message.Send(ws, string(b))
-}
-
-// handleWSPing send the appropriate response packet (pong) with the
-// same data as the given packet over the given WebSocket connection.
-func handleWSPing(pkt *packet, ws *websocket.Conn) error {
-	resp := newPacket(packetTypePong, pkt.data)
-	b, err := resp.MarshalText()
-	if err != nil {
-		return err
-	}
-	return websocket.Message.Send(ws, string(b))
-}
-
-// wsMainHandler continuously receives on the given WebSocket
-// connection and delegates the packets received to the appropriate
-// handler functions.
-func (s *server) wsMainHandler(ws *websocket.Conn) {
+// wsHandler continuously receives on the given WebSocket
+// connection and delegates the packets received to the
+// appropriate handler functions.
+func (s *server) wsHandler(ws *websocket.Conn) {
+	// If the client initially attempts to connect directly using
+	// WebSocket transport, the session ID parameter will be empty.
+	// Otherwise, the connection with the given session ID will
+	// need to be upgraded.
+	glog.Infoln("Starting websocket handler...")
 	var c *conn
-	var sid string
+	wsEncoder, wsDecoder := newPacketEncoder(ws), newPacketDecoder(ws)
 	for {
-		if len(sid) == 0 {
-			glog.Infoln("websocket: no session id.")
-			sid = ws.Request().FormValue(paramSessionID)
-			if len(sid) == 0 {
-				sid = s.wsHandshake(ws)
-			}
-		}
-		c = s.clients.get(sid)
-		if c == nil {
-			glog.Errorln("could not find connection with id", sid)
-			continue
-		}
-
-		glog.Infoln("waiting for websocket message")
-		pkt := &packet{}
-		if err := receiveWSPacket(ws, pkt); err != nil {
-			if err != io.EOF {
-				glog.Errorln("websocket read message error:", err)
-			}
-			break
-		}
-		glog.Infof("got websocket packet %+v from conn %p", pkt, ws)
-		if c.upgraded {
-			c.onPacket(pkt)
-			continue
-		}
-
-		// Client has not been upgraded yet.
-		if c.ws != nil && c.ws != ws {
-			glog.Errorf("websocket already associated with session %s", c.id)
-			break
-		}
-		c.ws = ws
-
-		switch pkt.typ {
-		case packetTypePing:
-			if err := handleWSPing(pkt, ws); err != nil {
-				glog.Errorf("problem handling websocket ping packet: %+v; error: %v", pkt, err)
+		if c != nil {
+			var pkt packet
+			if err := wsDecoder.decode(&pkt); err != nil {
+				glog.Errorf("could not decode packet: %v", err)
 				break
 			}
-			// Force a polling cycle to ensure a fast upgrade.
-			if data, _ := pkt.data.(string); data == messageProbe {
-				c.sendPacket(newPacket(packetTypeNoop, nil))
+			glog.Infof("WS: got packet type: %c, data: %s", pkt.typ, pkt.data)
+			if pkt.typ == packetTypeUpgrade {
+				// Upgrade the connection to use this WebSocket Conn.
+				c.upgrade(ws)
+				continue
 			}
-		case packetTypeUpgrade:
-			c.onUpgrade(pkt)
+			if err := s.handlePacket(pkt, c); err != nil {
+				glog.Errorf("could not handle packet: %v", err)
+				break
+			}
+			continue
+		}
+		id := ws.Request().FormValue(paramSessionID)
+		c = s.clients.get(id)
+		if len(id) > 0 && c == nil {
+			serverError(ws, errorUnknownSID)
+			break
+		} else if len(id) > 0 && c != nil {
+			// The initial handshake requires a ping (2) and pong (3) echo.
+			var pkt packet
+			if err := wsDecoder.decode(&pkt); err != nil {
+				glog.Errorf("could not decode packet: %v", err)
+				continue
+			}
+			glog.Infof("WS: got packet type: %c, data: %s", pkt.typ, pkt.data)
+			if pkt.typ == packetTypePing {
+				glog.Infof("got ping packet with data %s", pkt.data)
+				if err := wsEncoder.encode(packet{typ: packetTypePong, data: pkt.data}); err != nil {
+					glog.Errorf("could not encode pong packet: %v", err)
+					continue
+				}
+				// Force a polling cycle to ensure a fast upgrade.
+				glog.Infoln("forcing polling cycle")
+				payload := []packet{packet{typ: packetTypeNoop}}
+				if err := newPayloadEncoder(c).encode(payload); err != nil {
+					glog.Errorf("could not encode packet to force polling cycle: %v", err)
+					continue
+				}
+			}
+		} else if len(id) == 0 && c == nil {
+			// Create a new connection with this WebSocket Conn.
+			c = newConn()
+			c.ws = ws
+			s.clients.add(c)
+			b, err := handshakeData(c)
+			if err != nil {
+				glog.Errorf("could not get handshake data: %v", err)
+			}
+			if err := wsEncoder.encode(packet{typ: packetTypeOpen, data: b}); err != nil {
+				glog.Errorf("could not encode open packet: %v", err)
+				break
+			}
+			if s.Handler != nil {
+				go s.Handler(c.pubConn)
+			}
 		}
 	}
 	glog.Infof("closing websocket connection %p", ws)
@@ -281,74 +252,62 @@ func (s *server) wsMainHandler(ws *websocket.Conn) {
 // the client set.
 func (s *server) pollingHandler(w http.ResponseWriter, r *http.Request) {
 	setPollingHeaders(w, r)
-	sid := r.FormValue(paramSessionID)
-	if len(sid) > 0 {
-		socket := s.clients.get(sid)
-		if socket == nil {
+	id := r.FormValue(paramSessionID)
+	if len(id) > 0 {
+		c := s.clients.get(id)
+		if c == nil {
 			serverError(w, errorUnknownSID)
 			return
 		}
 		if r.Method == "POST" {
-			socket.pollingDataPost(w, r)
+			var payload []packet
+			if err := newPayloadDecoder(r.Body).decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			defer r.Body.Close()
+			for _, pkt := range payload {
+				s.handlePacket(pkt, c)
+			}
+			fmt.Fprintf(w, "ok")
 			return
 		} else if r.Method == "GET" {
-			socket.pollingDataGet(w, r)
+			glog.Infoln("GET request xhr polling data...")
+			if _, err := io.Copy(w, c); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
 			return
 		}
-		http.Error(w, "bad method", http.StatusBadRequest)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
 	s.pollingHandshake(w, r)
-}
-
-// wsHandshake creates a new FTC Conn with the given WebSocket connection
-// as the underlying transport and calls the server’s Handler. It returns
-// the session ID of the newly-created connection.
-func (s *server) wsHandshake(ws *websocket.Conn) string {
-	glog.Infof("starting websocket handshake. Handler: %+v", s.Handler)
-	c := newConn(s.pingInterval, s.pingTimeout, transportWebSocket)
-	s.clients.add(c)
-	err := c.open(ws)
-	if err != nil {
-		glog.Errorf("unable to open websocket connection: %v", err)
-	}
-	c.wsMu.Lock()
-	c.ws = ws
-	c.wsMu.Unlock()
-	c.upgraded = true
-	c.transport = transportWebSocket
-	go c.webSocketListener()
-
-	if s.Handler != nil {
-		go s.Handler(c)
-	}
-	return c.id
 }
 
 // pollingHandshake creates a new FTC Conn with the given HTTP Request and
 // ResponseWriter, setting a persistence cookie if necessary and calling
 // the server’s Handler.
 func (s *server) pollingHandshake(w http.ResponseWriter, r *http.Request) {
-	glog.Infof("starting polling handshake. Handler: %+v", s.Handler)
-	c := newConn(s.pingInterval, s.pingTimeout, transportPolling)
+	c := newConn()
 	s.clients.add(c)
-
 	if len(s.cookieName) > 0 {
-		glog.Infoln("setting cookie:", s.cookieName, c.id)
 		http.SetCookie(w, &http.Cookie{
 			Name:  s.cookieName,
 			Value: c.id,
 		})
 	}
-	err := c.open(w)
+	b, err := handshakeData(c)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		glog.Errorf("could not get handshake data: %v", err)
+	}
+	payload := []packet{packet{typ: packetTypeOpen, data: b}}
+	if err := newPayloadEncoder(w).encode(payload); err != nil {
+		glog.Errorf("could not encode open payload: %v", err)
 		return
 	}
-	c.transport = transportPolling
-	glog.Infof("polling handleshake complete. calling Handler: %+v", s.Handler)
 	if s.Handler != nil {
-		go s.Handler(c)
+		go s.Handler(c.pubConn)
 	}
 }
 
@@ -373,11 +332,24 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// serverError sends a JSON-encoded message to the given ResponseWriter
+// handshakeData returns the JSON encoded data needed
+// for the initial connection handshake.
+func handshakeData(c *conn) ([]byte, error) {
+	return json.Marshal(map[string]interface{}{
+		"pingInterval": 25000,
+		"pingTimeout":  60000,
+		"upgrades":     getValidUpgrades(),
+		"sid":          c.id,
+	})
+}
+
+// serverError sends a JSON-encoded message to the given io.Writer
 // with the given error code.
-func serverError(w http.ResponseWriter, code int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusBadRequest)
+func serverError(w io.Writer, code int) {
+	if rw, ok := w.(http.ResponseWriter); ok {
+		rw.Header().Set("Content-Type", "application/json")
+		rw.WriteHeader(http.StatusBadRequest)
+	}
 	msg := struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -389,6 +361,7 @@ func serverError(w http.ResponseWriter, code int) {
 		glog.Errorln("error encoding error msg %+v: %s", msg, err)
 		return
 	}
+	glog.Errorf("wrote server error: %+v", msg)
 }
 
 // setPollingHeaders sets the appropriate headers when responding

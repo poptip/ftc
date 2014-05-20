@@ -15,6 +15,7 @@ type clientSet struct {
 }
 
 // get returns the connection with the given ID, nil otherwise.
+// empty ids are not supported and will always return nil.
 func (c *clientSet) get(id string) *conn {
 	c.RLock()
 	defer c.RUnlock()
@@ -22,7 +23,11 @@ func (c *clientSet) get(id string) *conn {
 }
 
 // add adds a connection to the set keyed off its ID field.
+// If a conn has an empty ID, it is not added to the set.
 func (c *clientSet) add(con *conn) {
+	if len(con.id) == 0 {
+		return
+	}
 	c.Lock()
 	c.clients[con.id] = con
 	c.Unlock()
@@ -49,7 +54,7 @@ func (c *clientSet) reap() {
 	c.RLock()
 	toDelete := []string{}
 	for k, s := range c.clients {
-		if s.readyState() == readyStateClosed {
+		if s.closed {
 			toDelete = append(toDelete, k)
 		}
 	}
