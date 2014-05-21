@@ -2,4 +2,4 @@ FTC [![Build Status](https://travis-ci.org/poptip/ftc.svg?branch=master)](https:
 =========
 FTC (fault tolerant connection) is an [engine.io][0]-compatible library that provides fault tolerant, persistent client-server connections.
 
-[0] https://github.com/LearnBoost/engine.io-protocol
+[0]: https://github.com/LearnBoost/engine.io-protocol
