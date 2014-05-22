@@ -18,12 +18,7 @@ import (
 	"code.google.com/p/go.net/websocket"
 )
 
-var echoHandler = Handler(func(c *Conn) {
-	for {
-		io.Copy(c, c)
-	}
-	c.Close()
-})
+var echoHandler = Handler(func(c *Conn) { io.Copy(c, c) })
 
 func TestTransportParam(t *testing.T) {
 	ts := httptest.NewServer(NewServer(nil, nil))

@@ -113,7 +113,6 @@ func (c *conn) Read(p []byte) (int, error) {
 		return 0, errors.New("cannot read on closed connection")
 	}
 	if c.ws != nil {
-		// TODO(andybons): return io.EOF as the error to play nicely with io funcs.
 		return c.ws.Read(p)
 	}
 	select {
