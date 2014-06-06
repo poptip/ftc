@@ -46,6 +46,7 @@ func newPubConn(c *conn) *Conn {
 func (c *Conn) onMessage(msg []byte) {
 	select {
 	case c.msgs <- msg:
+		glog.Infoln("sent message to msgs chan:", string(msg))
 		return
 	case <-time.After(defaultTimeout):
 		glog.Warningln("onMessage timed out")
@@ -53,25 +54,27 @@ func (c *Conn) onMessage(msg []byte) {
 }
 
 func (c *Conn) Read(p []byte) (int, error) {
-	select {
-	case b := <-c.msgs:
-		return copy(p, b), nil
-	case <-time.After(defaultTimeout):
-		return 0, errors.New("timeout")
-	}
+	// TODO(andybons): if the connection is closed, return io.EOF.
+	return copy(p, <-c.msgs), nil
 }
 
 func (c *Conn) Write(p []byte) (int, error) {
 	pkt := packet{typ: packetTypeMessage, data: p}
-	if c.c.upgraded() {
+	c.c.mu.RLock()
+	defer c.c.mu.RUnlock()
+	if c.c.ws != nil {
 		return len(p), newPacketEncoder(c.c).encode(pkt)
 	}
 	return len(p), newPayloadEncoder(c.c).encode([]packet{pkt})
 }
 
+// Close closes the connection.
 func (c *Conn) Close() error {
-	err := c.c.Close()
-	c.c = nil
+	var err error
+	if c.c != nil {
+		err = c.c.Close()
+		c.c = nil
+	}
 	return err
 }
 

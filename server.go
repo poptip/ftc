@@ -70,12 +70,7 @@ func getValidUpgrades() []string {
 }
 
 // A Handler is called by the server when a connection is
-// opened successfully. An example echo handler is shown below.
-//   func EchoServer(c *ftc.conn) {
-//     io.Copy(c, c)
-//   }
-// It can then be used in combination with NewServer as follows:
-//   http.Handle("/engine.io/", ftc.NewServer(nil, ftc.Handler(EchoServer)))
+// opened successfully.
 type Handler func(*Conn)
 
 type server struct {
